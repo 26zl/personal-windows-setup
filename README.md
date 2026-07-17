@@ -1,6 +1,6 @@
-# windows-setup
+# personal-windows-setup
 
-[![lint](https://github.com/26zl/windows-setup/actions/workflows/lint.yml/badge.svg)](https://github.com/26zl/windows-setup/actions/workflows/lint.yml)
+[![lint](https://github.com/26zl/personal-windows-setup/actions/workflows/lint.yml/badge.svg)](https://github.com/26zl/personal-windows-setup/actions/workflows/lint.yml)
 ![Platform](https://img.shields.io/badge/platform-Windows%2011%20Pro-0078D6?logo=windows&logoColor=white)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207%2B-5391FE?logo=powershell&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -14,7 +14,7 @@ It isn't meant to cover everything, just a solid starting point with the basics.
 Open an **elevated** PowerShell (right-click → *Run as administrator*) and paste:
 
 ```powershell
-irm https://github.com/26zl/windows-setup/raw/main/setup.ps1 | iex
+irm https://github.com/26zl/personal-windows-setup/raw/main/setup.ps1 | iex
 ```
 
 Re-running is fine: installed apps are skipped. Note it also runs `winget upgrade --all`, which updates every winget app on the machine, not just the list here. Failures are listed at the end and logged to `%TEMP%`.
@@ -59,6 +59,7 @@ VS Build Tools and VirtualBox are large; remove those lines if you don't need th
 - Reboot after running to finish Sandbox, Hyper-V, and WSL2 (`wsl -l -v` to verify).
 - The external tweak tools (Win11Debloat, Winhance, PowerShellPerfect) only run if you explicitly type `y`, and each runs in its own process.
 - Only official upstream URLs are used; they fetch the latest version on each run.
+- The bundled `OfficeSetup.exe` is Microsoft's signed setup stub; the script verifies its Authenticode signature before running it.
 - Kubernetes runs inside Docker Desktop (enable it in Settings); no separate cluster tooling is installed.
 - Cloud and ops tooling (Ansible, Terraform, and similar) isn't installed by this script; install and run it inside the Debian WSL environment.
 - Java build tools (Maven, Gradle) aren't on winget; install them via Chocolatey or Scoop in a normal shell, or from the Debian WSL.

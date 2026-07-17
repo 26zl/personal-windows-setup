@@ -37,3 +37,6 @@ $RECYCLE.BIN/
 # PowerShell test / analysis output
 testResults*.xml
 coverage*.xml
+
+# IDE
+.claude/

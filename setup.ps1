@@ -1,7 +1,7 @@
 <#
   Personal Windows 11 Pro installer to run after a factory reset.
   Run in an ELEVATED PowerShell:
-    irm https://github.com/26zl/windows-setup/raw/main/setup.ps1 | iex
+    irm https://github.com/26zl/personal-windows-setup/raw/main/setup.ps1 | iex
   Add software by dropping its winget ID into a list below (winget search <name>).
   Re-running skips installed apps; failures are listed at the end and logged to %TEMP%.
 #>
@@ -208,7 +208,12 @@ if (Test-Path $word) {
 } else {
     $office = Join-Path $env:TEMP 'OfficeSetup.exe'
     try {
-        Invoke-WebRequest 'https://github.com/26zl/windows-setup/raw/main/office/OfficeSetup.exe' -OutFile $office -UseBasicParsing
+        Invoke-WebRequest 'https://github.com/26zl/personal-windows-setup/raw/main/office/OfficeSetup.exe' -OutFile $office -UseBasicParsing
+        # verify Microsoft's Authenticode signature before running as admin
+        $sig = Get-AuthenticodeSignature $office
+        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
+            throw "signature check failed (status $($sig.Status))"
+        }
         Write-Host "==> running OfficeSetup.exe" -ForegroundColor Cyan
         Start-Process $office -Wait
     } catch {
