@@ -3,7 +3,8 @@
   Run in an ELEVATED PowerShell:
     irm https://github.com/26zl/personal-windows-setup/raw/main/setup.ps1 | iex
   Add software by dropping its winget ID into a list below (winget search <name>).
-  Re-running skips installed apps; failures are listed at the end and logged to %TEMP%.
+  Re-running skips installed apps; failures are listed at the end. Every run writes a
+  full transcript plus a timestamped event log to %LOCALAPPDATA%\windows-setup\logs.
 #>
 
 $ErrorActionPreference = 'Continue'
@@ -22,9 +23,24 @@ if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
     return
 }
 
-# Run log
-$log = Join-Path $env:TEMP ("windows-setup-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
+# Run logs - persistent (BleachBit & co. wipe %TEMP%): transcript = full console
+# output, events = one timestamped line per outcome (installed / skipped / failed)
+$logDir = Join-Path $env:LOCALAPPDATA 'windows-setup\logs'
+try { $null = New-Item $logDir -ItemType Directory -Force } catch { $logDir = $env:TEMP }
+$stamp    = '{0:yyyyMMdd-HHmmss}' -f (Get-Date)
+$log      = Join-Path $logDir "transcript-$stamp.log"
+$eventLog = Join-Path $logDir "events-$stamp.log"
+$runStart = Get-Date
 try { Start-Transcript -Path $log -Append | Out-Null } catch { $log = $null }
+
+function Write-Event {
+    param([string]$Level, [string]$Message)
+    if (-not $script:eventLog) { return }
+    try   { "[{0:yyyy-MM-dd HH:mm:ss}] [{1,-4}] {2}" -f (Get-Date), $Level, $Message | Add-Content $script:eventLog -Encoding UTF8 }
+    catch { $script:eventLog = $null }   # never let logging break the run
+}
+$osCaption = (Get-CimInstance Win32_OperatingSystem).Caption
+Write-Event 'INFO' "run started - user=$env:USERNAME host=$env:COMPUTERNAME os=$osCaption"
 
 $Failed = @()
 $WingetOk = 0, -1978335189, -1978335135
@@ -33,8 +49,10 @@ function Install-App {
     param([string]$Id, [string]$Source = 'winget')
     Write-Host "==> $Id" -ForegroundColor Cyan
     winget install --id $Id --exact --source $Source --silent --accept-source-agreements --accept-package-agreements
-    if ($WingetOk -contains $LASTEXITCODE) { return }
+    if ($LASTEXITCODE -eq 0) { Write-Event 'OK' "$Id installed or updated"; return }
+    if ($WingetOk -contains $LASTEXITCODE) { Write-Event 'SKIP' "$Id already installed (exit $LASTEXITCODE)"; return }
     Write-Host "    FAILED: $Id (exit $LASTEXITCODE)" -ForegroundColor Yellow
+    Write-Event 'FAIL' "$Id (exit $LASTEXITCODE)"
     $script:Failed += $Id
 }
 
@@ -48,13 +66,14 @@ function Invoke-Tool {
     Write-Host ""
     Write-Host "  Tool: $Name" -ForegroundColor White
     if ((Read-Host "  Run it? Type y (anything else skips)") -notmatch '^(y|yes)$') {
-        Write-Host "    skipped $Name" -ForegroundColor DarkGray; return
+        Write-Host "    skipped $Name" -ForegroundColor DarkGray; Write-Event 'SKIP' "$Name skipped by user"; return
     }
     Write-Host "    launching in a new window - this window's output is preserved..." -ForegroundColor DarkGray
     $full = "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; $Command"
     $enc  = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($full))
     $proc = Start-Process powershell -PassThru -Wait -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$enc)
-    if ($proc.ExitCode -ne 0) { Write-Host "    $Name reported exit $($proc.ExitCode)" -ForegroundColor Yellow; $script:Failed += "$Name (external)" }
+    if ($proc.ExitCode -ne 0) { Write-Host "    $Name reported exit $($proc.ExitCode)" -ForegroundColor Yellow; Write-Event 'FAIL' "$Name (exit $($proc.ExitCode))"; $script:Failed += "$Name (external)" }
+    else { Write-Event 'OK' "$Name completed" }
 }
 
 try {
@@ -82,7 +101,6 @@ $winget = @(
     'EclipseAdoptium.Temurin.21.JDK'  # Java 21 LTS
     'Microsoft.DotNet.SDK.8'
     'RubyInstallerTeam.Ruby.3.4'      # Ruby 3.4
-    'StrawberryPerl.StrawberryPerl'
 
     # native build toolchains (C/C++, Rust MSVC, native node/python modules)
     'Microsoft.VisualStudio.2022.BuildTools'  # C++ toolset (VCTools workload) added below
@@ -101,6 +119,9 @@ $winget = @(
     'Oracle.VirtualBox'
     'DBeaver.DBeaver.Community'
     'Bruno.Bruno'
+
+    # ai / local llm
+    'Ollama.Ollama'                   # local LLM runtime (listens on localhost:11434)
 
     # sysadmin / networking
     'Microsoft.PowerToys'
@@ -126,6 +147,7 @@ $winget = @(
     # Tor Browser is installed below.
 
     # cleanup / maintenance
+    'Malwarebytes.Malwarebytes'       # anti-malware; free on-demand scanner after the trial
     'Malwarebytes.AdwCleaner'
     'BleachBit.BleachBit'
     'lostindark.DriverStoreExplorer'
@@ -146,6 +168,7 @@ Write-Host "==> TorProject.TorBrowser" -ForegroundColor Cyan
 $torExe = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Tor Browser\Browser\firefox.exe'
 if (Test-Path $torExe) {
     Write-Host "    already installed (skipped reinstall)" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'TorProject.TorBrowser already installed'
 } else {
     Install-App 'TorProject.TorBrowser'
 }
@@ -161,13 +184,16 @@ $vsSetup     = Join-Path $vsInstaller 'setup.exe'
 $vcComponent = 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64'
 if (-not (Test-Path $vswhere)) {
     Write-Host "    vswhere not found - BuildTools didn't install; re-run after it does" -ForegroundColor Yellow
+    Write-Event 'FAIL' 'VC++ toolset - vswhere missing (BuildTools not installed)'
     $Failed += 'VC++ toolset (BuildTools missing)'
 } else {
     $vcPath = & $vswhere -latest -products * -requires $vcComponent -property installationPath 2>$null
     if ($vcPath) {
         Write-Host "    already installed ($vcPath)" -ForegroundColor DarkGray
+        Write-Event 'SKIP' "VC++ toolset already installed ($vcPath)"
     } elseif (-not (Test-Path $vsSetup)) {
         Write-Host "    VS setup.exe not found (skipped)" -ForegroundColor Yellow
+        Write-Event 'FAIL' 'VC++ toolset - VS setup.exe missing'
         $Failed += 'VC++ toolset (setup.exe missing)'
     } else {
         $btPath = & $vswhere -products 'Microsoft.VisualStudio.Product.BuildTools' -property installationPath 2>$null |
@@ -186,9 +212,11 @@ if (-not (Test-Path $vswhere)) {
         $vcNow = & $vswhere -latest -products * -requires $vcComponent -property installationPath 2>$null
         if ($vcNow) {
             Write-Host "    MSVC C++ toolset installed (cl.exe, link.exe, CRT, Windows SDK)" -ForegroundColor DarkGray
+            Write-Event 'OK' 'VC++ toolset (VCTools workload) installed'
             if ($proc.ExitCode -eq 3010) { Write-Host "    reboot required to finish" -ForegroundColor Yellow }
         } else {
             Write-Host "    VCTools install failed (exit $($proc.ExitCode)) - component still missing" -ForegroundColor Yellow
+            Write-Event 'FAIL' "VC++ toolset (exit $($proc.ExitCode))"
             $Failed += 'VC++ toolset (VCTools workload)'
         }
     }
@@ -205,19 +233,27 @@ Write-Host "`n=== Microsoft Office ===" -ForegroundColor Magenta
 $word = Join-Path $env:ProgramFiles 'Microsoft Office\root\Office16\WINWORD.EXE'
 if (Test-Path $word) {
     Write-Host "    already installed (skipped)" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'Microsoft Office already installed'
 } else {
     $office = Join-Path $env:TEMP 'OfficeSetup.exe'
+    # pinned hash of office/OfficeSetup.exe in this repo; refresh with Get-FileHash if the stub is replaced
+    $officeSha256 = 'C0ED5DC2C0ABBE023684B1B4A4E3229D5E678D2FF30F5C147044D7AFBA88B04E'
     try {
         Invoke-WebRequest 'https://github.com/26zl/personal-windows-setup/raw/main/office/OfficeSetup.exe' -OutFile $office -UseBasicParsing
-        # verify Microsoft's Authenticode signature before running as admin
+        # verify pinned hash + Microsoft's Authenticode signature before running as admin
+        if ((Get-FileHash $office -Algorithm SHA256).Hash -ne $officeSha256) {
+            throw 'SHA256 mismatch - update $officeSha256 if you replaced the stub'
+        }
         $sig = Get-AuthenticodeSignature $office
-        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
+        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'CN=Microsoft Corporation(,|$)') {
             throw "signature check failed (status $($sig.Status))"
         }
         Write-Host "==> running OfficeSetup.exe" -ForegroundColor Cyan
         Start-Process $office -Wait
+        Write-Event 'OK' 'Microsoft Office setup ran'
     } catch {
         Write-Host "    Office install failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Event 'FAIL' "Microsoft Office - $($_.Exception.Message)"
         $Failed += 'Microsoft Office'
     }
 }
@@ -259,9 +295,11 @@ if ($sysDir) {
 Write-Host "`n=== Scoop ===" -ForegroundColor Magenta
 if (Get-Command scoop -ErrorAction SilentlyContinue) {
     Write-Host "    already installed" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'Scoop already installed'
 } else {
     Invoke-Child "& ([scriptblock]::Create((Invoke-RestMethod https://get.scoop.sh))) -RunAsAdmin"
-    if ($LASTEXITCODE -ne 0) { Write-Host "    Scoop reported exit $LASTEXITCODE" -ForegroundColor Yellow; $Failed += 'Scoop' }
+    if ($LASTEXITCODE -ne 0) { Write-Host "    Scoop reported exit $LASTEXITCODE" -ForegroundColor Yellow; Write-Event 'FAIL' "Scoop (exit $LASTEXITCODE)"; $Failed += 'Scoop' }
+    else { Write-Event 'OK' 'Scoop installed' }
 }
 
 # pipx
@@ -269,29 +307,34 @@ Write-Host "`n=== pipx ===" -ForegroundColor Magenta
 $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
 if (Get-Command python -ErrorAction SilentlyContinue) {
     python -m pip install --user --upgrade pipx
-    if ($LASTEXITCODE -eq 0) { python -m pipx ensurepath }
-    else { Write-Host "    pipx install failed (exit $LASTEXITCODE)" -ForegroundColor Yellow; $Failed += 'pipx' }
+    if ($LASTEXITCODE -eq 0) { python -m pipx ensurepath; Write-Event 'OK' 'pipx installed' }
+    else { Write-Host "    pipx install failed (exit $LASTEXITCODE)" -ForegroundColor Yellow; Write-Event 'FAIL' "pipx (exit $LASTEXITCODE)"; $Failed += 'pipx' }
 } else {
     Write-Host "    python not on PATH yet - after reboot run: python -m pip install --user pipx" -ForegroundColor Yellow
+    Write-Event 'WARN' 'pipx deferred - python not on PATH this run'
     $Failed += 'pipx (python not found this run)'
 }
 
 # Windows features
 Write-Host "`n=== Windows features ===" -ForegroundColor Magenta
-if ((Get-CimInstance Win32_OperatingSystem).Caption -match 'Home') {
+if ($osCaption -match 'Home') {
     Write-Host "    Sandbox + Hyper-V skipped - need Windows Pro/Enterprise/Education" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'Sandbox + Hyper-V skipped (Windows Home)'
 } else {
     foreach ($f in 'Containers-DisposableClientVM','Microsoft-Hyper-V-All') {
         $info = dism.exe /online /get-featureinfo "/featurename:$f" 2>&1 | Out-String
         if ($info -match 'State\s*:\s*Enable') {
             Write-Host "    $f already enabled" -ForegroundColor DarkGray
+            Write-Event 'SKIP' "feature $f already enabled"
             continue
         }
         dism.exe /online /enable-feature "/featurename:$f" /all /norestart | Out-Null
         if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 3010) {
             Write-Host "    $f enabled (reboot to finish)" -ForegroundColor DarkGray
+            Write-Event 'OK' "feature $f enabled (reboot to finish)"
         } else {
             Write-Host "    feature failed: $f (dism exit $LASTEXITCODE)" -ForegroundColor Yellow
+            Write-Event 'FAIL' "feature $f (dism exit $LASTEXITCODE)"
             $Failed += "feature: $f"
         }
     }
@@ -302,20 +345,24 @@ $wslDistros = (wsl.exe --list --quiet 2>$null) -replace "`0", '' |
               ForEach-Object { $_.Trim() } | Where-Object { $_ }
 if ($wslDistros -contains 'Debian') {
     Write-Host "    Debian (WSL) already installed" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'Debian (WSL) already installed'
 } else {
     wsl --install -d Debian
-    if ($LASTEXITCODE -ne 0) { Write-Host "    WSL/Debian returned exit $LASTEXITCODE - verify after reboot: wsl -l -v" -ForegroundColor Yellow; $Failed += 'WSL2/Debian' }
+    if ($LASTEXITCODE -ne 0) { Write-Host "    WSL/Debian returned exit $LASTEXITCODE - verify after reboot: wsl -l -v" -ForegroundColor Yellow; Write-Event 'FAIL' "WSL2/Debian (exit $LASTEXITCODE)"; $Failed += 'WSL2/Debian' }
+    else { Write-Event 'OK' 'WSL2/Debian install initiated (finishes after reboot)' }
 }
 
 # Claude Code
 Write-Host "`n=== Claude Code (official native installer) ===" -ForegroundColor Magenta
 Invoke-Child "& ([scriptblock]::Create((Invoke-RestMethod https://claude.ai/install.ps1)))"
-if ($LASTEXITCODE -ne 0) { Write-Host "    Claude Code reported exit $LASTEXITCODE" -ForegroundColor Yellow; $Failed += 'Claude Code' }
+if ($LASTEXITCODE -ne 0) { Write-Host "    Claude Code reported exit $LASTEXITCODE" -ForegroundColor Yellow; Write-Event 'FAIL' "Claude Code (exit $LASTEXITCODE)"; $Failed += 'Claude Code' }
+else { Write-Event 'OK' 'Claude Code installed/updated (native installer)' }
 
 # Update installed apps
 Write-Host "`n=== Updating installed apps ===" -ForegroundColor Magenta
 winget upgrade --all --silent --accept-source-agreements --accept-package-agreements
 if ($LASTEXITCODE -ne 0) { Write-Host "    some upgrades reported issues (exit $LASTEXITCODE)" -ForegroundColor DarkGray }
+Write-Event 'INFO' "winget upgrade --all finished (exit $LASTEXITCODE)"
 
 # Summary
 Write-Host "`n=====================================================" -ForegroundColor Green
@@ -326,7 +373,8 @@ if ($Failed.Count -eq 0) {
     $Failed | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
 }
 Write-Host "Reboot to finish features and WSL2, then verify: Windows features, 'wsl -l -v', and that the tweak tools ran." -ForegroundColor Cyan
-if ($log) { Write-Host "Full log: $log" -ForegroundColor DarkGray }
+if ($log) { Write-Host "Transcript: $log" -ForegroundColor DarkGray }
+if ($eventLog) { Write-Host "Event log:  $eventLog" -ForegroundColor DarkGray }
 Write-Host "=====================================================" -ForegroundColor Green
 
 # External tweak tools
@@ -338,8 +386,12 @@ if ((Read-Host "Configure any tweak tools? Type y to choose them one by one (any
     Invoke-Tool 'PowerShellPerfect (your profile)' "& ([scriptblock]::Create((Invoke-RestMethod 'https://github.com/26zl/PowerShellPerfect/raw/main/setup.ps1'))) -SkipHashCheck"
 } else {
     Write-Host "    skipped all tweak tools" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'all tweak tools skipped'
 }
 
 } finally {
+    $mins = [Math]::Round(((Get-Date) - $runStart).TotalMinutes, 1)
+    $tail = if ($Failed.Count) { ": $($Failed -join ', ')" } else { '' }
+    Write-Event 'INFO' "run ended after $mins min - $($Failed.Count) tracked failure(s)$tail"
     if ($log) { Stop-Transcript | Out-Null }
 }

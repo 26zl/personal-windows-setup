@@ -17,7 +17,7 @@ Open an **elevated** PowerShell (right-click → *Run as administrator*) and pas
 irm https://github.com/26zl/personal-windows-setup/raw/main/setup.ps1 | iex
 ```
 
-Re-running is fine: installed apps are skipped. Note it also runs `winget upgrade --all`, which updates every winget app on the machine, not just the list here. Failures are listed at the end and logged to `%TEMP%`.
+Re-running is fine: installed apps are skipped. Note it also runs `winget upgrade --all`, which updates every winget app on the machine, not just the list here. Failures are listed at the end. Every run writes two files to `%LOCALAPPDATA%\windows-setup\logs` (kept out of `%TEMP%` so cleanup tools don't wipe them): a full console transcript (`transcript-*.log`) and a timestamped event log (`events-*.log`) showing exactly what was installed, skipped, or failed, and when.
 
 > `irm | iex` downloads and runs this script as Administrator. Read [`setup.ps1`](setup.ps1) first if you don't trust it. If scripts are blocked, run `Set-ExecutionPolicy -Scope Process Bypass` in the same window first.
 
@@ -29,15 +29,16 @@ Re-running is fine: installed apps are skipped. Note it also runs `winget upgrad
 
 ## What it installs
 
-- **Languages:** Python, Node.js LTS, Go, Rust, Java (Temurin 21), .NET SDK, Ruby, Perl
+- **Languages:** Python, Node.js LTS, Go, Rust, Java (Temurin 21), .NET SDK, Ruby
 - **Build tools:** VS Build Tools + MSVC C++ toolset (compiler, linker, CRT, Windows SDK — for Rust MSVC & native modules), LLVM/Clang, MSYS2 (gcc/make)
 - **Package managers:** pnpm, Bun, Chocolatey, Scoop, pipx, uv, UniGetUI (GUI front-end) (npm/corepack come with Node; pipx via pip)
 - **Dev tools:** Git, GitHub CLI, GitHub Desktop, VS Code, Windows Terminal, PowerShell 7, 7-Zip, VC++ Redistributables, just, jq, adb (platform-tools)
 - **Fullstack:** Docker Desktop, VirtualBox, DBeaver, Bruno
+- **AI:** Ollama (local LLM runtime)
 - **Sysadmin / net:** PowerToys, Sysinternals Suite, WinSCP, PuTTY, MobaXterm, Tailscale, WireGuard, Mullvad VPN
 - **Cybersec:** Wireshark, Nmap, Burp Suite Community, KeePassXC
 - **Browser:** Google Chrome, Tor Browser
-- **Cleanup / maintenance:** AdwCleaner, BleachBit, DriverStore Explorer
+- **Cleanup / maintenance:** Malwarebytes, AdwCleaner, BleachBit, DriverStore Explorer
 - **Utilities:** Rufus, balenaEtcher, Steam, Windows Notepad (Store)
 - **Tweak / privacy:** O&O ShutUp10, Win11Debloat, Winhance, Harden System Security (Store)
 - **Claude Code** via its official native installer
@@ -59,7 +60,7 @@ VS Build Tools and VirtualBox are large; remove those lines if you don't need th
 - Reboot after running to finish Sandbox, Hyper-V, and WSL2 (`wsl -l -v` to verify).
 - The external tweak tools (Win11Debloat, Winhance, PowerShellPerfect) only run if you explicitly type `y`, and each runs in its own process.
 - Only official upstream URLs are used; they fetch the latest version on each run.
-- The bundled `OfficeSetup.exe` is Microsoft's signed setup stub; the script verifies its Authenticode signature before running it.
+- The bundled `OfficeSetup.exe` is Microsoft's signed setup stub; the script verifies its pinned SHA-256 hash and Microsoft's Authenticode signature before running it. If you ever replace the stub, refresh `$officeSha256` in `setup.ps1` with `Get-FileHash office\OfficeSetup.exe`.
 - Kubernetes runs inside Docker Desktop (enable it in Settings); no separate cluster tooling is installed.
 - Cloud and ops tooling (Ansible, Terraform, and similar) isn't installed by this script; install and run it inside the Debian WSL environment.
 - Java build tools (Maven, Gradle) aren't on winget; install them via Chocolatey or Scoop in a normal shell, or from the Debian WSL.
