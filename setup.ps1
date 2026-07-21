@@ -192,8 +192,6 @@ $winget = @(
     'Balena.Etcher'
     'Valve.Steam'
 
-    # communication
-    'Discord.Discord'
 )
 Write-Host "`n=== winget apps ($($winget.Count)) ===" -ForegroundColor Magenta
 foreach ($pkg in $winget) { Install-App $pkg }
@@ -206,6 +204,17 @@ if (Test-Path $torExe) {
     Write-Event 'SKIP' 'TorProject.TorBrowser already installed'
 } else {
     Install-App 'TorProject.TorBrowser'
+}
+
+# Discord installs per-user and keeps itself updated, so only install it when missing.
+# Re-running winget on it while it is open triggers a Squirrel "burn it to the ground"
+# reinstall that dies with access-denied - and it would just self-update anyway.
+if (Test-Path (Join-Path $env:LOCALAPPDATA 'Discord\Update.exe')) {
+    Write-Host "==> Discord.Discord" -ForegroundColor Cyan
+    Write-Host "    already installed (skipped; Discord updates itself)" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'Discord already installed'
+} else {
+    Install-App 'Discord.Discord'
 }
 
 # MSVC C++ build toolset - the winget BuildTools package ships no workloads, so
@@ -305,7 +314,7 @@ Write-Host "`n=== Desktop shortcuts (portable apps) ===" -ForegroundColor Magent
 $desktop = [Environment]::GetFolderPath('Desktop')
 $pkgRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
 $portables = @{
-    'OO-Software.ShutUp10'            = 'OOSU10.exe'
+    'OO-Software.ShutUp10'            = 'shutup10.exe'   # O&O ShutUp10++ renamed the exe from OOSU10.exe
     'lostindark.DriverStoreExplorer' = 'RAPR.exe'
     'Malwarebytes.AdwCleaner'        = 'adwcleaner.exe'
     'Rufus.Rufus'                    = 'rufus*.exe'
@@ -443,11 +452,17 @@ try {
     $Failed += 'ConfigureDefender'
 }
 
-# Claude Code
+# Claude Code - the native installer keeps itself updated, so only run it when claude is missing.
 Write-Host "`n=== Claude Code (official native installer) ===" -ForegroundColor Magenta
-Invoke-Child "& ([scriptblock]::Create((Invoke-RestMethod https://claude.ai/install.ps1)))"
-if ($LASTEXITCODE -ne 0) { Write-Host "    Claude Code reported exit $LASTEXITCODE" -ForegroundColor Yellow; Write-Event 'FAIL' "Claude Code (exit $LASTEXITCODE)"; $Failed += 'Claude Code' }
-else { Write-Event 'OK' 'Claude Code installed/updated (native installer)' }
+$claudeExe = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
+if ((Get-Command claude -ErrorAction SilentlyContinue) -or (Test-Path $claudeExe)) {
+    Write-Host "    already installed (skipped; it self-updates)" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'Claude Code already installed'
+} else {
+    Invoke-Child "& ([scriptblock]::Create((Invoke-RestMethod https://claude.ai/install.ps1)))"
+    if ($LASTEXITCODE -ne 0) { Write-Host "    Claude Code reported exit $LASTEXITCODE" -ForegroundColor Yellow; Write-Event 'FAIL' "Claude Code (exit $LASTEXITCODE)"; $Failed += 'Claude Code' }
+    else { Write-Event 'OK' 'Claude Code installed (native installer)' }
+}
 
 # System integrity - repair the component store (DISM) then system files (SFC).
 # DISM runs first because SFC restores files from the component store DISM maintains.
@@ -519,9 +534,11 @@ if ((Read-Host "Check dual-boot settings? Type y (anything else skips)") -match 
     }
 
     Write-Host "  --- changes (each is optional) ---" -ForegroundColor White
+    $offered = $false
     # Hibernation off - clears Fast Startup too (it needs hibernation) and frees a RAM-sized
     # hiberfil.sys; the single switch that stops Windows leaving NTFS locked/hibernated for dual boot
     if ($hiberEnabled -ne 0) {
+        $offered = $true
         Write-Host "  Turning hibernation off also removes Fast Startup and frees a RAM-sized hiberfil.sys. Keep it only if you use Hibernate/sleep-to-disk." -ForegroundColor DarkGray
         if ((Read-Host "  Disable hibernation entirely? (powercfg /h off) Type y") -match '^(y|yes)$') {
             powercfg.exe /hibernate off
@@ -536,6 +553,7 @@ if ((Read-Host "Check dual-boot settings? Type y (anything else skips)") -match 
     }
     # RTC as UTC - only right when the OTHER OS uses UTC (Linux/macOS), NOT Windows+Windows
     if ($rtcUtc -ne 1) {
+        $offered = $true
         Write-Host "  Set the hardware clock to UTC only if your other OS is Linux/macOS. Skip it for Windows + Windows." -ForegroundColor DarkGray
         if ((Read-Host "  Set hardware clock to UTC? Type y") -match '^(y|yes)$') {
             Set-ItemProperty $tzKey -Name RealTimeIsUniversal -Value 1 -Type DWord
@@ -543,6 +561,7 @@ if ((Read-Host "Check dual-boot settings? Type y (anything else skips)") -match 
             Write-Event 'OK' 'dual-boot: RTC set to UTC'
         } else { Write-Event 'SKIP' 'dual-boot: RTC left as local time' }
     }
+    if (-not $offered) { Write-Host "  nothing to change - already dual-boot friendly" -ForegroundColor DarkGray }
     Write-Event 'INFO' "dual-boot state: winLoaders=$winLoaders fastStartup=$hiberboot hibernation=$hiberEnabled rtcUtc=$rtcUtc secureBoot=$secureBoot bitlocker=$blOn"
 } else {
     Write-Host "    skipped dual-boot checks" -ForegroundColor DarkGray
