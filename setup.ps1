@@ -75,6 +75,42 @@ function Invoke-Tool {
     else { Write-Event 'OK' "$Name completed" }
 }
 
+function Set-WingetUpgradeDelay {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([int]$Days = 7)
+    # Hold winget upgrades back for packages whose latest build is under $Days days old - a
+    # supply-chain safeguard (not a bug-fix delay): if a publisher is compromised and ships a
+    # malicious release, the window keeps it off this machine long enough for the bad version to
+    # be caught and pulled before it auto-installs. settings.json is JSONC (comments + trailing
+    # commas), so strip those before parsing, and merge rather than overwrite existing settings.
+    $schemaUrl = 'https://aka.ms/winget-settings.schema.json'
+    $path = $null
+    try { $path = (winget settings export 2>$null | ConvertFrom-Json).userSettingsFile } catch { $path = $null }
+    if (-not $path) { $path = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\settings.json' }
+    try {
+        $obj = $null
+        $raw = if (Test-Path $path) { Get-Content $path -Raw } else { $null }
+        if ($raw -and $raw.Trim()) {
+            $clean = [regex]::Replace($raw, '("(?:\\.|[^"\\])*")|/\*[\s\S]*?\*/|//[^\r\n]*', '$1')
+            $clean = [regex]::Replace($clean, ',(?=\s*[}\]])', '')
+            $obj   = $clean | ConvertFrom-Json
+        }
+        if ($null -eq $obj) { $obj = [pscustomobject]@{ '$schema' = $schemaUrl } }
+        if ($null -eq $obj.installBehavior) { $obj | Add-Member -NotePropertyName installBehavior -NotePropertyValue ([pscustomobject]@{}) -Force }
+        $obj.installBehavior | Add-Member -NotePropertyName upgradeDelayInDays -NotePropertyValue $Days -Force
+        if ($PSCmdlet.ShouldProcess($path, "set upgradeDelayInDays=$Days")) {
+            $null = New-Item (Split-Path $path) -ItemType Directory -Force
+            [IO.File]::WriteAllText($path, ($obj | ConvertTo-Json -Depth 10), (New-Object Text.UTF8Encoding($false)))
+            Write-Host "    upgradeDelayInDays = $Days (supply-chain soak: skips packages newer than $Days days)" -ForegroundColor DarkGray
+            Write-Event 'OK' "winget upgradeDelayInDays set to $Days"
+        }
+    } catch {
+        Write-Host "    could not set upgradeDelayInDays: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "    left settings.json untouched - set it yourself via 'winget settings'" -ForegroundColor DarkGray
+        Write-Event 'WARN' "winget upgradeDelayInDays not set - $($_.Exception.Message)"
+    }
+}
+
 try {
 
 # winget apps
@@ -372,17 +408,193 @@ if ($null -ne $sysmonSvc -and $sysmonSvc.State -eq 'Running') {
     $Failed += 'Sysmon'
 }
 
+# ConfigureDefender (AndyFul) - a GUI to review/adjust Microsoft Defender's advanced
+# settings (ASR rules, cloud level, SmartScreen, etc.). Installed and verified only:
+# it is intentionally NOT run or auto-configured here. Open it from the Desktop
+# shortcut and pick a protection level yourself.
+Write-Host "`n=== ConfigureDefender (Defender settings GUI) ===" -ForegroundColor Magenta
+$cdDir = Join-Path $env:LOCALAPPDATA 'windows-setup\tools'
+$cdExe = Join-Path $cdDir 'ConfigureDefender.exe'
+$cdUrl = 'https://github.com/AndyFul/ConfigureDefender/raw/master/ConfigureDefender.exe'
+# pinned hash of AndyFul's signed build; refresh with Get-FileHash if he ships a new one
+$cdSha256 = 'BD7630B6AD94F8ED2024E5E98A24B6FEDBB5F2B8A058B70C8FFEEFE98A7DCCA2'
+try {
+    $null = New-Item $cdDir -ItemType Directory -Force
+    Invoke-WebRequest $cdUrl -OutFile $cdExe -UseBasicParsing
+    # verify the pinned hash + the author's Authenticode signature before keeping it
+    if ((Get-FileHash $cdExe -Algorithm SHA256).Hash -ne $cdSha256) {
+        throw 'SHA256 mismatch - refresh $cdSha256 if AndyFul published a new build'
+    }
+    $sig = Get-AuthenticodeSignature $cdExe
+    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Andrzej Pluta') {
+        throw "signature check failed (status $($sig.Status))"
+    }
+    if (-not $desktop) { $desktop = [Environment]::GetFolderPath('Desktop') }
+    if (-not $shell)   { $shell   = New-Object -ComObject WScript.Shell }
+    $lnk = $shell.CreateShortcut((Join-Path $desktop 'ConfigureDefender.lnk'))
+    $lnk.TargetPath = $cdExe
+    $lnk.Save()
+    Write-Host "    installed (not configured) -> $cdExe" -ForegroundColor DarkGray
+    Write-Host "    Desktop shortcut added; open it and choose a protection level yourself." -ForegroundColor DarkGray
+    Write-Event 'OK' 'ConfigureDefender installed (verified, not configured)'
+} catch {
+    Write-Host "    ConfigureDefender failed: $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Event 'FAIL' "ConfigureDefender - $($_.Exception.Message)"
+    $Failed += 'ConfigureDefender'
+}
+
 # Claude Code
 Write-Host "`n=== Claude Code (official native installer) ===" -ForegroundColor Magenta
 Invoke-Child "& ([scriptblock]::Create((Invoke-RestMethod https://claude.ai/install.ps1)))"
 if ($LASTEXITCODE -ne 0) { Write-Host "    Claude Code reported exit $LASTEXITCODE" -ForegroundColor Yellow; Write-Event 'FAIL' "Claude Code (exit $LASTEXITCODE)"; $Failed += 'Claude Code' }
 else { Write-Event 'OK' 'Claude Code installed/updated (native installer)' }
 
-# Update installed apps
-Write-Host "`n=== Updating installed apps ===" -ForegroundColor Magenta
-winget upgrade --all --silent --accept-source-agreements --accept-package-agreements
-if ($LASTEXITCODE -ne 0) { Write-Host "    some upgrades reported issues (exit $LASTEXITCODE)" -ForegroundColor DarkGray }
-Write-Event 'INFO' "winget upgrade --all finished (exit $LASTEXITCODE)"
+# System integrity - repair the component store (DISM) then system files (SFC).
+# DISM runs first because SFC restores files from the component store DISM maintains.
+Write-Host "`n=== System integrity (DISM + SFC) ===" -ForegroundColor Magenta
+Write-Host "==> DISM /ScanHealth (checking the component store - can take a few minutes)" -ForegroundColor Cyan
+$dismScan = dism.exe /online /cleanup-image /scanhealth 2>&1 | Out-String
+$scanExit = $LASTEXITCODE
+($dismScan -split "`r?`n" | Where-Object { $_ -match '\S' } | Select-Object -Last 2) |
+    ForEach-Object { Write-Host "    $($_.Trim())" -ForegroundColor DarkGray }
+if ($scanExit -eq 0 -and $dismScan -match 'No component store corruption detected') {
+    Write-Host "    component store is healthy" -ForegroundColor DarkGray
+    Write-Event 'OK' 'DISM ScanHealth - no corruption'
+} else {
+    Write-Host "==> corruption indicated - DISM /RestoreHealth (may download from Windows Update)" -ForegroundColor Cyan
+    dism.exe /online /cleanup-image /restorehealth
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "    component store repaired" -ForegroundColor DarkGray
+        Write-Event 'OK' 'DISM RestoreHealth succeeded'
+    } else {
+        Write-Host "    DISM RestoreHealth exit $LASTEXITCODE - see %WINDIR%\Logs\DISM\dism.log" -ForegroundColor Yellow
+        Write-Event 'FAIL' "DISM RestoreHealth (exit $LASTEXITCODE)"
+        $Failed += 'DISM RestoreHealth'
+    }
+}
+Write-Host "==> sfc /scannow (verifying system files)" -ForegroundColor Cyan
+sfc.exe /scannow
+$sfcExit = $LASTEXITCODE
+if ($sfcExit -eq 0) {
+    Write-Host "    SFC finished" -ForegroundColor DarkGray
+    Write-Event 'OK' 'sfc /scannow finished (exit 0)'
+} else {
+    Write-Host "    sfc /scannow exit $sfcExit - review %WINDIR%\Logs\CBS\CBS.log if it could not fix a file" -ForegroundColor Yellow
+    Write-Event 'WARN' "sfc /scannow (exit $sfcExit)"
+}
+
+# Dual-boot checks & tweaks (opt in) - the few Windows settings that matter when it
+# shares a machine with another OS. Read-only report first, then each change is its own y/n.
+Write-Host "`n=== Dual-boot checks & tweaks (opt in) ===" -ForegroundColor Magenta
+if ((Read-Host "Check dual-boot settings? Type y (anything else skips)") -match '^(y|yes)$') {
+    $powerKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'
+    $tzKey    = 'HKLM:\SYSTEM\CurrentControlSet\Control\TimeZoneInformation'
+    $hiberboot    = (Get-ItemProperty $powerKey -Name HiberbootEnabled -ErrorAction SilentlyContinue).HiberbootEnabled
+    $hiberEnabled = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' -Name HibernateEnabled -ErrorAction SilentlyContinue).HibernateEnabled
+    $rtcUtc       = (Get-ItemProperty $tzKey -Name RealTimeIsUniversal -ErrorAction SilentlyContinue).RealTimeIsUniversal
+
+    # boot store: how many Windows OS loaders, plus non-Windows firmware boot entries
+    $winLoaders = ([regex]::Matches((bcdedit /enum osloader 2>$null | Out-String), '(?im)^\s*description\s+.+$')).Count
+    $fwDescs = [regex]::Matches((bcdedit /enum firmware 2>$null | Out-String), '(?im)^\s*description\s+(.+?)\s*$') |
+               ForEach-Object { $_.Groups[1].Value.Trim() } |
+               Where-Object { $_ -and $_ -notmatch '^Windows Boot Manager$' } | Select-Object -Unique
+    $secureBoot = try { if (Confirm-SecureBootUEFI) { 'ON' } else { 'OFF' } } catch { 'n/a (legacy BIOS or unsupported)' }
+    $blOn = try { @(Get-BitLockerVolume -ErrorAction Stop | Where-Object { $_.ProtectionStatus -eq 'On' }).Count } catch { 0 }
+
+    Write-Host "  --- current state ---" -ForegroundColor White
+    Write-Host ("  Windows installs in boot store : {0}" -f $winLoaders) -ForegroundColor Gray
+    if ($fwDescs) { Write-Host ("  Other firmware boot entries    : {0}" -f ($fwDescs -join ', ')) -ForegroundColor Gray }
+    else          { Write-Host  "  Other firmware boot entries    : none (only Windows Boot Manager)" -ForegroundColor Gray }
+    Write-Host ("  Fast Startup                   : {0}" -f $(if ($hiberboot -eq 0) { 'OFF (good)' } elseif ($null -eq $hiberboot) { 'not set' } else { 'ON (locks NTFS while hibernation is on)' })) -ForegroundColor Gray
+    Write-Host ("  Hibernation                    : {0}" -f $(if ($hiberEnabled -eq 0) { 'OFF' } elseif ($null -eq $hiberEnabled) { 'unknown' } else { 'ON (hiberfil.sys uses ~RAM-sized disk)' })) -ForegroundColor Gray
+    Write-Host ("  Hardware clock                 : {0}" -f $(if ($rtcUtc -eq 1) { 'UTC (matches Linux)' } else { 'local time (Windows default)' })) -ForegroundColor Gray
+    Write-Host ("  Secure Boot                    : {0}" -f $secureBoot) -ForegroundColor Gray
+    if ($blOn -gt 0) {
+        Write-Host ("  BitLocker                      : ON ({0} volume(s)) - back up your recovery key before Secure Boot / firmware changes" -f $blOn) -ForegroundColor Yellow
+    } else {
+        Write-Host  "  BitLocker                      : off / none" -ForegroundColor Gray
+    }
+    if ($winLoaders -gt 1) {
+        Write-Host "  Note: multiple Windows installs detected - Fast Startup must be OFF in EACH so they don't lock each other's NTFS." -ForegroundColor Yellow
+    }
+
+    Write-Host "  --- changes (each is optional) ---" -ForegroundColor White
+    # Hibernation off - clears Fast Startup too (it needs hibernation) and frees a RAM-sized
+    # hiberfil.sys; the single switch that stops Windows leaving NTFS locked/hibernated for dual boot
+    if ($hiberEnabled -ne 0) {
+        Write-Host "  Turning hibernation off also removes Fast Startup and frees a RAM-sized hiberfil.sys. Keep it only if you use Hibernate/sleep-to-disk." -ForegroundColor DarkGray
+        if ((Read-Host "  Disable hibernation entirely? (powercfg /h off) Type y") -match '^(y|yes)$') {
+            powercfg.exe /hibernate off
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "    hibernation disabled (hiberfil.sys removed; Fast Startup off too)" -ForegroundColor DarkGray
+                Write-Event 'OK' 'dual-boot: hibernation disabled (powercfg /h off)'
+            } else {
+                Write-Host "    powercfg /h off exit $LASTEXITCODE" -ForegroundColor Yellow
+                Write-Event 'WARN' "dual-boot: powercfg /h off (exit $LASTEXITCODE)"
+            }
+        } else { Write-Event 'SKIP' 'dual-boot: hibernation left enabled' }
+    }
+    # RTC as UTC - only right when the OTHER OS uses UTC (Linux/macOS), NOT Windows+Windows
+    if ($rtcUtc -ne 1) {
+        Write-Host "  Set the hardware clock to UTC only if your other OS is Linux/macOS. Skip it for Windows + Windows." -ForegroundColor DarkGray
+        if ((Read-Host "  Set hardware clock to UTC? Type y") -match '^(y|yes)$') {
+            Set-ItemProperty $tzKey -Name RealTimeIsUniversal -Value 1 -Type DWord
+            Write-Host "    RealTimeIsUniversal=1 (Windows now reads the RTC as UTC)" -ForegroundColor DarkGray
+            Write-Event 'OK' 'dual-boot: RTC set to UTC'
+        } else { Write-Event 'SKIP' 'dual-boot: RTC left as local time' }
+    }
+    Write-Event 'INFO' "dual-boot state: winLoaders=$winLoaders fastStartup=$hiberboot hibernation=$hiberEnabled rtcUtc=$rtcUtc secureBoot=$secureBoot bitlocker=$blOn"
+} else {
+    Write-Host "    skipped dual-boot checks" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'dual-boot checks skipped by user'
+}
+
+# winget update policy - applied before upgrading (and it sticks for future upgrades too).
+# Defense-in-depth against supply-chain attacks: hold back any package released in the last
+# 7 days so a compromised or trojaned release has time to be detected and pulled before it lands.
+Write-Host "`n=== winget update policy ===" -ForegroundColor Magenta
+Set-WingetUpgradeDelay -Days 7
+
+# Update installed apps (opt in)
+Write-Host "`n=== Update installed apps (opt in) ===" -ForegroundColor Magenta
+if ((Read-Host "Update all installed apps now? (winget upgrade --all) Type y (anything else skips)") -match '^(y|yes)$') {
+    winget upgrade --all --silent --accept-source-agreements --accept-package-agreements
+    if ($LASTEXITCODE -ne 0) { Write-Host "    some upgrades reported issues (exit $LASTEXITCODE)" -ForegroundColor DarkGray }
+    Write-Event 'INFO' "winget upgrade --all finished (exit $LASTEXITCODE)"
+} else {
+    Write-Host "    skipped app updates" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'winget upgrade --all skipped by user'
+}
+
+# Disk cleanup - the last built-in step before the external tweak tools. Non-interactive
+# and safe: superseded components, the Windows Update cache, temp folders, Recycle Bin.
+Write-Host "`n=== Disk cleanup ===" -ForegroundColor Magenta
+$freeBefore = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'").FreeSpace
+# 1) component store: drop superseded update payloads
+Write-Host "==> DISM /StartComponentCleanup" -ForegroundColor Cyan
+dism.exe /online /cleanup-image /startcomponentcleanup | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Host "    component cleanup exit $LASTEXITCODE (continuing)" -ForegroundColor DarkGray }
+# 2) Windows Update download cache
+Write-Host "==> Windows Update cache" -ForegroundColor Cyan
+try {
+    Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
+    $wuCache = Join-Path $env:SystemRoot 'SoftwareDistribution\Download'
+    if (Test-Path $wuCache) { Get-ChildItem $wuCache -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue }
+    Start-Service wuauserv -ErrorAction SilentlyContinue
+} catch { Write-Host "    update-cache step skipped ($($_.Exception.Message))" -ForegroundColor DarkGray }
+# 3) temp folders (anything a running process holds open is skipped)
+Write-Host "==> temp folders" -ForegroundColor Cyan
+foreach ($t in @($env:TEMP, (Join-Path $env:SystemRoot 'Temp'))) {
+    if ($t -and (Test-Path $t)) { Get-ChildItem $t -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue }
+}
+# 4) Recycle Bin
+Write-Host "==> Recycle Bin" -ForegroundColor Cyan
+Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+$freeAfter = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'").FreeSpace
+$freed = [math]::Round((($freeAfter - $freeBefore) / 1GB), 2)
+if ($freed -gt 0) { Write-Host ("    freed about {0} GB on {1}" -f $freed, $env:SystemDrive) -ForegroundColor DarkGray }
+else              { Write-Host  "    cleanup done" -ForegroundColor DarkGray }
+Write-Event 'INFO' ("disk cleanup done (freed ~{0} GB)" -f $freed)
 
 # External tweak tools
 Write-Host "`n=== External tweak tools (opt in) ===" -ForegroundColor Magenta

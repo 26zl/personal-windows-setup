@@ -17,7 +17,7 @@ Open an **elevated** PowerShell (right-click → *Run as administrator*) and pas
 irm https://github.com/26zl/personal-windows-setup/raw/main/setup.ps1 | iex
 ```
 
-Re-running is fine: installed apps are skipped. Note it also runs `winget upgrade --all`, which updates every winget app on the machine, not just the list here. Failures are listed at the end. Every run writes two files to `%LOCALAPPDATA%\windows-setup\logs` (kept out of `%TEMP%` so cleanup tools don't wipe them): a full console transcript (`transcript-*.log`) and a timestamped event log (`events-*.log`) showing exactly what was installed, skipped, or failed, and when.
+Re-running is fine: installed apps are skipped. It then asks (y/n) whether to run `winget upgrade --all`, which updates every winget app on the machine, not just the list here. Failures are listed at the end. Every run writes two files to `%LOCALAPPDATA%\windows-setup\logs` (kept out of `%TEMP%` so cleanup tools don't wipe them): a full console transcript (`transcript-*.log`) and a timestamped event log (`events-*.log`) showing exactly what was installed, skipped, or failed, and when.
 
 > `irm | iex` downloads and runs this script as Administrator. Read [`setup.ps1`](setup.ps1) first if you don't trust it. If scripts are blocked, run `Set-ExecutionPolicy -Scope Process Bypass` in the same window first.
 
@@ -36,7 +36,7 @@ Re-running is fine: installed apps are skipped. Note it also runs `winget upgrad
 - **Fullstack:** Docker Desktop, VirtualBox, DBeaver, Bruno
 - **AI:** Ollama (local LLM runtime)
 - **Sysadmin / net:** PowerToys, Sysinternals Suite, WinSCP, PuTTY, MobaXterm, Tailscale, WireGuard, Mullvad VPN
-- **Cybersec:** Wireshark, Nmap, Burp Suite Community, KeePassXC
+- **Cybersec:** Wireshark, Nmap, Burp Suite Community, KeePassXC, ConfigureDefender (Defender settings GUI — installed & signature-verified only, never auto-configured)
 - **Sysmon:** system activity logging to the event log — built-in Sysmon on Windows 11 24H2+ (enables the optional feature if needed), signature-checked Sysinternals download on older Windows, configured with a pinned [SwiftOnSecurity config](sysmon/sysmonconfig-export.xml) and a 512 MB log
 - **Browser:** Google Chrome, Tor Browser
 - **Cleanup / maintenance:** Malwarebytes, AdwCleaner, BleachBit, DriverStore Explorer
@@ -45,6 +45,9 @@ Re-running is fine: installed apps are skipped. Note it also runs `winget upgrad
 - **Claude Code** via its official native installer
 - **PowerShellPerfect** (my own profile)
 - Enables Windows Sandbox, Hyper-V, and WSL2 with Debian as the default distro
+- **System integrity:** a DISM component-store check (auto-repairs with `/RestoreHealth` only if corruption is found) followed by `sfc /scannow`
+- **Disk cleanup** (runs near the end, just before the external tweak tools): DISM component cleanup, the Windows Update download cache, temp folders, and the Recycle Bin
+- **Dual-boot checks (opt-in, y/n):** reports boot entries, Fast Startup, hibernation, hardware-clock (UTC vs local), Secure Boot, and BitLocker, then offers to disable hibernation entirely (`powercfg /h off`, which also clears Fast Startup) and set the clock to UTC
 
 ## Customize
 
@@ -62,6 +65,9 @@ VS Build Tools and VirtualBox are large; remove those lines if you don't need th
 - The external tweak tools (Win11Debloat, Winhance, PowerShellPerfect) only run if you explicitly type `y`, and each runs in its own process.
 - Automatic installers come from the named vendors or projects; review their URLs and current contents before opting in because most are fetched at run time.
 - The bundled `OfficeSetup.exe` is Microsoft's signed setup stub; the script verifies its pinned SHA-256 hash and Microsoft's Authenticode signature before running it. If you ever replace the stub, refresh `$officeSha256` in `setup.ps1` with `Get-FileHash office\OfficeSetup.exe`.
+- Before updating, the script sets winget's `installBehavior.upgradeDelayInDays` to **7** in `settings.json`, so `winget upgrade --all` (and any future upgrade) skips packages released in the last 7 days. This is a **supply-chain safeguard**, not a bug-fix delay: if a publisher is compromised and pushes a malicious release, the window keeps it off the machine long enough for the bad version to be spotted and pulled before it auto-installs. It merges into your existing winget settings rather than overwriting them. Change the `7` in `setup.ps1`, or clear it later with `winget settings`.
+- **ConfigureDefender** is downloaded from AndyFul's official repo and verified (pinned SHA-256 + the author's Authenticode signature) before it's kept, then given a Desktop shortcut. It is never launched or auto-configured — open it and pick a protection level (Default / High / Max) yourself. Refresh `$cdSha256` in `setup.ps1` if AndyFul ships a new build.
+- **Dual-boot** checks are opt-in (y/n) and read-only until you confirm each change. Disabling hibernation (`powercfg /h off`, which also clears Fast Startup) is safe for any dual boot and should be done in *every* Windows install that shares the disk. Setting the hardware clock to UTC is only correct when the other OS uses UTC (Linux/macOS) — leave it off for Windows + Windows. If BitLocker is on, back up your recovery key before touching Secure Boot or firmware settings or you may hit a recovery prompt at boot.
 - Sysmon can also be set up on its own (existing machines, no full setup needed) from an elevated PowerShell: `irm https://github.com/26zl/personal-windows-setup/raw/main/sysmon/install-sysmon.ps1 | iex`. Re-running only reapplies the config. If you replace `sysmon\sysmonconfig-export.xml` (e.g. with a newer SwiftOnSecurity release), refresh `$configSha256` in `install-sysmon.ps1` with `Get-FileHash sysmon\sysmonconfig-export.xml`.
 - Kubernetes runs inside Docker Desktop (enable it in Settings); no separate cluster tooling is installed.
 - Cloud and ops tooling (Ansible, Terraform, and similar) isn't installed by this script; install and run it inside the Debian WSL environment.
@@ -70,4 +76,4 @@ VS Build Tools and VirtualBox are large; remove those lines if you don't need th
 
 ## License
 
-Project code is MIT licensed. The bundled Sysmon configuration is CC BY 4.0; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution.
+Project code is MIT licensed. The bundled Sysmon configuration is [SwiftOnSecurity's sysmon-config](https://github.com/SwiftOnSecurity/sysmon-config), licensed CC BY 4.0; its attribution and license notice are retained in the header of [`sysmon/sysmonconfig-export.xml`](sysmon/sysmonconfig-export.xml).

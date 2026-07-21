@@ -1,0 +1,14 @@
+# Normalize text to LF so a committed blob is byte-identical to what GitHub
+# serves from /raw/. This keeps the SHA-256 pins in setup.ps1 and
+# sysmon/install-sysmon.ps1 valid whether a file is pulled via `irm | iex`
+# (LF, straight from raw) or read from a local clone. Without this, core.autocrlf
+# checks files out as CRLF and the clone-path hash no longer matches the pin.
+* text=auto eol=lf
+
+# Keep binaries byte-exact (also pinned by SHA-256 where they are executed).
+*.exe binary
+*.pdf binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.zip binary

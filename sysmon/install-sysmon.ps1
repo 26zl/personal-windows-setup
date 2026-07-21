@@ -10,8 +10,11 @@
     2. Standalone Sysinternals Sysmon from download.sysinternals.com,
        Authenticode-verified before it runs as admin.
   Config: SwiftOnSecurity sysmon-config, pinned by SHA-256. A copy next to this
-  script wins (cloned repo); otherwise it is fetched from this repo. If you
-  replace sysmon\sysmonconfig-export.xml, refresh $configSha256 with Get-FileHash.
+  script wins (cloned repo); otherwise it is fetched from this repo. The repo
+  normalizes the XML to LF (.gitattributes), so the same hash matches whether the
+  file is downloaded from raw or read from a clone. If you replace
+  sysmon\sysmonconfig-export.xml, refresh $configSha256 with Get-FileHash - and
+  commit it so the LF blob that GitHub serves matches the pin.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -26,7 +29,7 @@ if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole(
     return
 }
 
-$configSha256 = '055FEBC600E6D7448CDF3812307275912927A62B1F94D0D933B64B294BC87162'
+$configSha256 = 'AF4C914DAC315FD36288A8CE3C346490D8F737AAAA87E83EA96DFF893AC6E053'
 $configUrl    = 'https://github.com/26zl/personal-windows-setup/raw/main/sysmon/sysmonconfig-export.xml'
 $stagedConfig = 'C:\ProgramData\Sysmon\sysmonconfig-export.xml'
 $logChannel   = 'Microsoft-Windows-Sysmon/Operational'
