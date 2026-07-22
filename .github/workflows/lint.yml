@@ -20,3 +20,20 @@ jobs:
           $results = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
           $results | Format-Table -AutoSize
           if ($results | Where-Object Severity -in 'Error','Warning') { exit 1 }
+      - name: Verify pinned SHA-256 hashes match committed files
+        shell: pwsh
+        run: |
+          $checks = @(
+            @{ File = 'office/OfficeSetup.exe';        Script = 'setup.ps1';                 Pat = "officeSha256\s*=\s*'([A-F0-9]{64})'" }
+            @{ File = 'sysmon/sysmonconfig-export.xml'; Script = 'sysmon/install-sysmon.ps1'; Pat = "configSha256\s*=\s*'([A-F0-9]{64})'" }
+          )
+          $ok = $true
+          foreach ($c in $checks) {
+            $m   = Select-String -Path $c.Script -Pattern $c.Pat
+            $pin = if ($m) { $m.Matches[0].Groups[1].Value } else { $null }
+            $actual = (Get-FileHash $c.File -Algorithm SHA256).Hash
+            if (-not $pin)            { Write-Host "::error::no SHA-256 pin found in $($c.Script)"; $ok = $false }
+            elseif ($pin -ne $actual) { Write-Host "::error::$($c.File) hash drift - pin=$pin actual=$actual"; $ok = $false }
+            else                      { Write-Host "OK  $($c.File) matches pin" }
+          }
+          if (-not $ok) { exit 1 }

@@ -78,11 +78,8 @@ function Invoke-Tool {
 function Set-WingetUpgradeDelay {
     [CmdletBinding(SupportsShouldProcess)]
     param([int]$Days = 7)
-    # Hold winget upgrades back for packages whose latest build is under $Days days old - a
-    # supply-chain safeguard (not a bug-fix delay): if a publisher is compromised and ships a
-    # malicious release, the window keeps it off this machine long enough for the bad version to
-    # be caught and pulled before it auto-installs. settings.json is JSONC (comments + trailing
-    # commas), so strip those before parsing, and merge rather than overwrite existing settings.
+    # Hold winget upgrades for packages newer than $Days days (supply-chain soak). settings.json
+    # is JSONC, so strip comments/trailing commas before parsing and merge into existing settings.
     $schemaUrl = 'https://aka.ms/winget-settings.schema.json'
     $path = $null
     try { $path = (winget settings export 2>$null | ConvertFrom-Json).userSettingsFile } catch { $path = $null }
@@ -111,7 +108,44 @@ function Set-WingetUpgradeDelay {
     }
 }
 
+function New-SetupRestorePoint {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([string]$Description)
+    # System Restore checkpoint. Enables protection if off and lifts the 24h throttle so both
+    # points get created, then restores it. Best-effort.
+    $srKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
+    if (-not $PSCmdlet.ShouldProcess($env:COMPUTERNAME, "create System Restore point '$Description'")) { return }
+    try {
+        Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction Stop
+    } catch {
+        Write-Host "    could not enable System Protection: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Event 'WARN' "restore point '$Description' - Enable-ComputerRestore failed: $($_.Exception.Message)"
+        return
+    }
+    $hadFreq  = $false
+    $prevFreq = $null
+    try {
+        $existing = Get-ItemProperty $srKey -Name SystemRestorePointCreationFrequency -ErrorAction SilentlyContinue
+        if ($null -ne $existing) { $hadFreq = $true; $prevFreq = $existing.SystemRestorePointCreationFrequency }
+        Set-ItemProperty $srKey -Name SystemRestorePointCreationFrequency -Value 0 -Type DWord -ErrorAction SilentlyContinue
+        Checkpoint-Computer -Description $Description -RestorePointType 'MODIFY_SETTINGS' -ErrorAction Stop
+        Write-Host "    restore point created: $Description" -ForegroundColor DarkGray
+        Write-Event 'OK' "restore point created: $Description"
+    } catch {
+        Write-Host "    restore point failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Event 'WARN' "restore point '$Description' failed: $($_.Exception.Message)"
+    } finally {
+        # put the 24h throttle back the way we found it
+        if ($hadFreq) { Set-ItemProperty $srKey -Name SystemRestorePointCreationFrequency -Value $prevFreq -Type DWord -ErrorAction SilentlyContinue }
+        else          { Remove-ItemProperty $srKey -Name SystemRestorePointCreationFrequency -ErrorAction SilentlyContinue }
+    }
+}
+
 try {
+
+# Restore point before any changes.
+Write-Host "`n=== System Restore point (before) ===" -ForegroundColor Magenta
+New-SetupRestorePoint "Before windows-setup ($stamp)"
 
 # winget apps
 $winget = @(
@@ -122,10 +156,13 @@ $winget = @(
     'GitHub.cli'
     'GitHub.GitHubDesktop'
     'Microsoft.VisualStudioCode'
+    'Neovim.Neovim'                   # Neovim (my config is cloned in below)
     '7zip.7zip'
     'Microsoft.VCRedist.2015+.x64'    # C++ runtimes many apps need
     'Casey.Just'                      # command runner (justfiles)
     'jqlang.jq'                       # JSON processor
+    'BurntSushi.ripgrep.MSVC'         # ripgrep - Telescope live-grep (nvim)
+    'sharkdp.fd'                      # fd - Telescope file finding (nvim)
     'Google.PlatformTools'           # Android adb + fastboot
 
     # languages
@@ -206,9 +243,7 @@ if (Test-Path $torExe) {
     Install-App 'TorProject.TorBrowser'
 }
 
-# Discord installs per-user and keeps itself updated, so only install it when missing.
-# Re-running winget on it while it is open triggers a Squirrel "burn it to the ground"
-# reinstall that dies with access-denied - and it would just self-update anyway.
+# Discord self-updates and reinstalls badly via winget while open, so only install when missing.
 if (Test-Path (Join-Path $env:LOCALAPPDATA 'Discord\Update.exe')) {
     Write-Host "==> Discord.Discord" -ForegroundColor Cyan
     Write-Host "    already installed (skipped; Discord updates itself)" -ForegroundColor DarkGray
@@ -217,10 +252,7 @@ if (Test-Path (Join-Path $env:LOCALAPPDATA 'Discord\Update.exe')) {
     Install-App 'Discord.Discord'
 }
 
-# MSVC C++ build toolset - the winget BuildTools package ships no workloads, so
-# add VCTools here. --includeRecommended pulls the full native toolchain
-# (cl.exe compiler, link.exe linker, CRT/STL, CMake/MSBuild, Windows SDK) that
-# Rust MSVC, node-gyp and native Python modules all build against.
+# BuildTools ships no workloads, so add the VCTools workload (C++ compiler, linker, SDK).
 Write-Host "`n=== MSVC C++ build toolset ===" -ForegroundColor Magenta
 $vsInstaller = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
 $vswhere     = Join-Path $vsInstaller 'vswhere.exe'
@@ -266,7 +298,6 @@ if (-not (Test-Path $vswhere)) {
     }
 }
 
-# Microsoft Store apps via winget
 Write-Host "`n=== Store apps ===" -ForegroundColor Magenta
 Install-App '9P7GGFL7DX57' 'msstore'   # Harden System Security
 Install-App '9MSMLRH6LZF3' 'msstore'   # Windows Notepad
@@ -283,7 +314,7 @@ if (Test-Path $word) {
     # pinned hash of office/OfficeSetup.exe in this repo; refresh with Get-FileHash if the stub is replaced
     $officeSha256 = 'C0ED5DC2C0ABBE023684B1B4A4E3229D5E678D2FF30F5C147044D7AFBA88B04E'
     try {
-        Invoke-WebRequest 'https://github.com/26zl/personal-windows-setup/raw/main/office/OfficeSetup.exe' -OutFile $office -UseBasicParsing
+        Invoke-WebRequest 'https://github.com/26zl/personal-windows-setup/raw/main/office/OfficeSetup.exe' -OutFile $office -UseBasicParsing -TimeoutSec 300
         # verify pinned hash + Microsoft's Authenticode signature before running as admin
         if ((Get-FileHash $office -Algorithm SHA256).Hash -ne $officeSha256) {
             throw 'SHA256 mismatch - update $officeSha256 if you replaced the stub'
@@ -309,7 +340,6 @@ if (Test-Path $word) {
     }
 }
 
-# Desktop shortcuts for portable GUI apps
 Write-Host "`n=== Desktop shortcuts (portable apps) ===" -ForegroundColor Magenta
 $desktop = [Environment]::GetFolderPath('Desktop')
 $pkgRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
@@ -342,7 +372,6 @@ if ($sysDir) {
     Write-Host "    Sysinternals : folder not found (skipped)" -ForegroundColor DarkGray
 }
 
-# Scoop
 Write-Host "`n=== Scoop ===" -ForegroundColor Magenta
 if (Get-Command scoop -ErrorAction SilentlyContinue) {
     Write-Host "    already installed" -ForegroundColor DarkGray
@@ -353,7 +382,6 @@ if (Get-Command scoop -ErrorAction SilentlyContinue) {
     else { Write-Event 'OK' 'Scoop installed' }
 }
 
-# pipx
 Write-Host "`n=== pipx ===" -ForegroundColor Magenta
 $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
 if (Get-Command python -ErrorAction SilentlyContinue) {
@@ -366,7 +394,112 @@ if (Get-Command python -ErrorAction SilentlyContinue) {
     $Failed += 'pipx (python not found this run)'
 }
 
-# Windows features
+# GitHub sign-in + git identity (opt in). Safe under elevation on Windows (same user).
+Write-Host "`n=== GitHub sign-in & git identity (opt in) ===" -ForegroundColor Magenta
+$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
+if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+    Write-Host "    gh not on PATH yet - after reboot run: gh auth login --web; gh auth setup-git" -ForegroundColor Yellow
+    Write-Event 'WARN' 'GitHub sign-in deferred - gh not on PATH this run'
+} elseif ((Read-Host "Sign in to GitHub and set your git identity now? Type y (anything else skips)") -match '^(y|yes)$') {
+    gh auth status 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "    opening your browser to log in..." -ForegroundColor DarkGray
+        gh auth login --hostname github.com --git-protocol https --web
+    } else {
+        Write-Host "    already logged in to GitHub" -ForegroundColor DarkGray
+    }
+    if ($LASTEXITCODE -eq 0) {
+        gh auth setup-git
+        git config --global init.defaultBranch main
+        git config --global pull.rebase false
+        git config --global push.autoSetupRemote true
+        $login = (gh api user --jq .login              2>$null); $login = "$login".Trim()
+        $ghId  = (gh api user --jq .id                  2>$null); $ghId  = "$ghId".Trim()
+        $email = (gh api user --jq '.email // empty'    2>$null); $email = "$email".Trim()
+        if ($login) {
+            if (-not $email) { $email = "$ghId+$login@users.noreply.github.com" }
+            git config --global user.name  $login
+            git config --global user.email $email
+            Write-Host "    git identity: $(git config --global user.name) <$(git config --global user.email)>" -ForegroundColor DarkGray
+            Write-Event 'OK' "GitHub sign-in + git identity set ($login)"
+        } else {
+            Write-Host "    signed in, but couldn't read the account - git identity left unchanged" -ForegroundColor Yellow
+            Write-Event 'WARN' 'GitHub signed in but gh api user returned empty - identity unchanged'
+        }
+    } else {
+        Write-Host "    GitHub login not completed - git identity left unchanged" -ForegroundColor Yellow
+        Write-Event 'WARN' 'GitHub login not completed'
+    }
+} else {
+    Write-Host "    skipped GitHub sign-in" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'GitHub sign-in skipped by user'
+}
+
+# Neovim config: run the repo's install.ps1 (backs up existing, or git pulls). Needs a C compiler.
+Write-Host "`n=== Neovim config ===" -ForegroundColor Magenta
+$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
+$nvimCfg = Join-Path $env:LOCALAPPDATA 'nvim'
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    Write-Host "    git not on PATH yet - after reboot run: irm https://github.com/26zl/nvim/raw/main/install.ps1 | iex" -ForegroundColor Yellow
+    Write-Event 'WARN' 'Neovim config deferred - git not on PATH this run'
+    $Failed += 'Neovim config (git not found this run)'
+} else {
+    Invoke-Child "& ([scriptblock]::Create((Invoke-RestMethod https://github.com/26zl/nvim/raw/main/install.ps1)))"
+    if (Test-Path (Join-Path $nvimCfg 'init.lua')) {
+        Write-Host "    Neovim config ready -> $nvimCfg (plugins install on first 'nvim' launch)" -ForegroundColor DarkGray
+        Write-Event 'OK' 'Neovim config installed via install.ps1'
+    } else {
+        Write-Host "    Neovim config install failed - see output above" -ForegroundColor Yellow
+        Write-Event 'FAIL' 'Neovim config (install.ps1)'
+        $Failed += 'Neovim config'
+    }
+}
+# Same config in WSL Debian (opt in): official Neovim tarball + deps + clone, run as root
+# via a temp /mnt script to avoid wsl.exe arg-quoting issues.
+$wslReady = $false
+try { wsl.exe -d Debian -u root -- true 2>$null; $wslReady = ($LASTEXITCODE -eq 0) } catch { $wslReady = $false }
+if (-not $wslReady) {
+    Write-Host "    WSL Debian not ready yet (finishes after reboot) - re-run to set up Neovim there, or see the nvim README" -ForegroundColor DarkGray
+    Write-Event 'INFO' 'Neovim/WSL skipped - Debian not ready this run'
+} elseif ((Read-Host "Set up the same Neovim in WSL Debian too? Type y (anything else skips)") -match '^(y|yes)$') {
+    $wslScript = @'
+set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq git curl ripgrep fd-find build-essential unzip ca-certificates >/dev/null
+if ! command -v nvim >/dev/null 2>&1 || ! nvim --version | head -1 | grep -qE 'v0\.(1[1-9]|[2-9][0-9])'; then
+  curl -fsSLo /tmp/nvim.tar.gz https://github.com/neovim/neovim/releases/download/stable/nvim-linux-x86_64.tar.gz
+  rm -rf /opt/nvim-linux-x86_64
+  tar -C /opt -xzf /tmp/nvim.tar.gz
+  ln -sf /opt/nvim-linux-x86_64/bin/nvim /usr/local/bin/nvim
+  rm -f /tmp/nvim.tar.gz
+fi
+command -v fdfind >/dev/null 2>&1 && ln -sf "$(command -v fdfind)" /usr/local/bin/fd || true
+u=$(getent passwd 1000 | cut -d: -f1)
+h=$(getent passwd 1000 | cut -d: -f6)
+if [ -n "$u" ] && [ ! -f "$h/.config/nvim/init.lua" ]; then
+  runuser -u "$u" -- git clone https://github.com/26zl/nvim "$h/.config/nvim"
+fi
+echo "WSL_NVIM_DONE $(nvim --version | head -1)"
+'@ -replace "`r`n", "`n"
+    $wslSh = Join-Path $env:TEMP 'wsl-nvim-setup.sh'
+    [IO.File]::WriteAllText($wslSh, $wslScript, (New-Object Text.UTF8Encoding($false)))
+    $wslPath = '/mnt/' + $wslSh.Substring(0,1).ToLower() + ($wslSh.Substring(2) -replace '\\','/')
+    wsl.exe -d Debian -u root -- bash $wslPath
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "    Neovim set up in WSL Debian (run 'nvim' inside WSL; plugins install on first launch)" -ForegroundColor DarkGray
+        Write-Event 'OK' 'Neovim installed + configured in WSL Debian'
+    } else {
+        Write-Host "    WSL Neovim setup reported exit $LASTEXITCODE" -ForegroundColor Yellow
+        Write-Event 'FAIL' "Neovim/WSL setup (exit $LASTEXITCODE)"
+        $Failed += 'Neovim (WSL)'
+    }
+    Remove-Item $wslSh -ErrorAction SilentlyContinue
+} else {
+    Write-Host "    skipped WSL Neovim setup" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'Neovim/WSL skipped by user'
+}
+
 Write-Host "`n=== Windows features ===" -ForegroundColor Magenta
 if ($osCaption -match 'Home') {
     Write-Host "    Sandbox + Hyper-V skipped - need Windows Pro/Enterprise/Education" -ForegroundColor DarkGray
@@ -417,10 +550,7 @@ if ($null -ne $sysmonSvc -and $sysmonSvc.State -eq 'Running') {
     $Failed += 'Sysmon'
 }
 
-# ConfigureDefender (AndyFul) - a GUI to review/adjust Microsoft Defender's advanced
-# settings (ASR rules, cloud level, SmartScreen, etc.). Installed and verified only:
-# it is intentionally NOT run or auto-configured here. Open it from the Desktop
-# shortcut and pick a protection level yourself.
+# ConfigureDefender (AndyFul): Defender settings GUI. Installed + verified only, never auto-run.
 Write-Host "`n=== ConfigureDefender (Defender settings GUI) ===" -ForegroundColor Magenta
 $cdDir = Join-Path $env:LOCALAPPDATA 'windows-setup\tools'
 $cdExe = Join-Path $cdDir 'ConfigureDefender.exe'
@@ -429,7 +559,7 @@ $cdUrl = 'https://github.com/AndyFul/ConfigureDefender/raw/master/ConfigureDefen
 $cdSha256 = 'BD7630B6AD94F8ED2024E5E98A24B6FEDBB5F2B8A058B70C8FFEEFE98A7DCCA2'
 try {
     $null = New-Item $cdDir -ItemType Directory -Force
-    Invoke-WebRequest $cdUrl -OutFile $cdExe -UseBasicParsing
+    Invoke-WebRequest $cdUrl -OutFile $cdExe -UseBasicParsing -TimeoutSec 300
     # verify the pinned hash + the author's Authenticode signature before keeping it
     if ((Get-FileHash $cdExe -Algorithm SHA256).Hash -ne $cdSha256) {
         throw 'SHA256 mismatch - refresh $cdSha256 if AndyFul published a new build'
@@ -464,8 +594,7 @@ if ((Get-Command claude -ErrorAction SilentlyContinue) -or (Test-Path $claudeExe
     else { Write-Event 'OK' 'Claude Code installed (native installer)' }
 }
 
-# System integrity - repair the component store (DISM) then system files (SFC).
-# DISM runs first because SFC restores files from the component store DISM maintains.
+# System integrity: DISM first (repairs the component store), then SFC (uses it).
 Write-Host "`n=== System integrity (DISM + SFC) ===" -ForegroundColor Magenta
 Write-Host "==> DISM /ScanHealth (checking the component store - can take a few minutes)" -ForegroundColor Cyan
 $dismScan = dism.exe /online /cleanup-image /scanhealth 2>&1 | Out-String
@@ -498,8 +627,7 @@ if ($sfcExit -eq 0) {
     Write-Event 'WARN' "sfc /scannow (exit $sfcExit)"
 }
 
-# Dual-boot checks & tweaks (opt in) - the few Windows settings that matter when it
-# shares a machine with another OS. Read-only report first, then each change is its own y/n.
+# Dual-boot checks & tweaks (opt in). Read-only report first, then each change is its own y/n.
 Write-Host "`n=== Dual-boot checks & tweaks (opt in) ===" -ForegroundColor Magenta
 if ((Read-Host "Check dual-boot settings? Type y (anything else skips)") -match '^(y|yes)$') {
     $powerKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'
@@ -535,8 +663,7 @@ if ((Read-Host "Check dual-boot settings? Type y (anything else skips)") -match 
 
     Write-Host "  --- changes (each is optional) ---" -ForegroundColor White
     $offered = $false
-    # Hibernation off - clears Fast Startup too (it needs hibernation) and frees a RAM-sized
-    # hiberfil.sys; the single switch that stops Windows leaving NTFS locked/hibernated for dual boot
+    # Disabling hibernation also clears Fast Startup and frees hiberfil.sys (good for dual boot).
     if ($hiberEnabled -ne 0) {
         $offered = $true
         Write-Host "  Turning hibernation off also removes Fast Startup and frees a RAM-sized hiberfil.sys. Keep it only if you use Hibernate/sleep-to-disk." -ForegroundColor DarkGray
@@ -568,9 +695,7 @@ if ((Read-Host "Check dual-boot settings? Type y (anything else skips)") -match 
     Write-Event 'SKIP' 'dual-boot checks skipped by user'
 }
 
-# winget update policy - applied before upgrading (and it sticks for future upgrades too).
-# Defense-in-depth against supply-chain attacks: hold back any package released in the last
-# 7 days so a compromised or trojaned release has time to be detected and pulled before it lands.
+# winget update policy: hold back packages released in the last 7 days (supply-chain soak).
 Write-Host "`n=== winget update policy ===" -ForegroundColor Magenta
 Set-WingetUpgradeDelay -Days 7
 
@@ -585,8 +710,7 @@ if ((Read-Host "Update all installed apps now? (winget upgrade --all) Type y (an
     Write-Event 'SKIP' 'winget upgrade --all skipped by user'
 }
 
-# Disk cleanup - the last built-in step before the external tweak tools. Non-interactive
-# and safe: superseded components, the Windows Update cache, temp folders, Recycle Bin.
+# Disk cleanup: superseded components, Windows Update cache, temp folders, Recycle Bin.
 Write-Host "`n=== Disk cleanup ===" -ForegroundColor Magenta
 $freeBefore = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'").FreeSpace
 # 1) component store: drop superseded update payloads
@@ -626,6 +750,10 @@ if ((Read-Host "Configure any tweak tools? Type y to choose them one by one (any
     Write-Host "    skipped all tweak tools" -ForegroundColor DarkGray
     Write-Event 'SKIP' 'all tweak tools skipped'
 }
+
+# Restore point after setup.
+Write-Host "`n=== System Restore point (after) ===" -ForegroundColor Magenta
+New-SetupRestorePoint "After windows-setup ($stamp)"
 
 # Summary
 Write-Host "`n=====================================================" -ForegroundColor Green

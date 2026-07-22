@@ -32,7 +32,7 @@ Re-running is fine: installed apps are skipped. It then asks (y/n) whether to ru
 - **Languages:** Python, Node.js LTS, Go, Rust, Java (Temurin 21), .NET SDK, Ruby
 - **Build tools:** VS Build Tools + MSVC C++ toolset (compiler, linker, CRT, Windows SDK — for Rust MSVC & native modules), LLVM/Clang, MSYS2 (gcc/make)
 - **Package managers:** pnpm, Bun, Chocolatey, Scoop, pipx, uv, UniGetUI (GUI front-end) (npm/corepack come with Node; pipx via pip)
-- **Dev tools:** Git, GitHub CLI, GitHub Desktop, VS Code, Windows Terminal, PowerShell 7, 7-Zip, VC++ Redistributables, just, jq, adb (platform-tools)
+- **Dev tools:** Git, GitHub CLI, GitHub Desktop, VS Code, Neovim (+ my [nvim config](https://github.com/26zl/nvim)), Windows Terminal, PowerShell 7, 7-Zip, VC++ Redistributables, just, jq, ripgrep, fd, adb (platform-tools)
 - **Fullstack:** Docker Desktop, VirtualBox, DBeaver, Bruno
 - **AI:** Ollama (local LLM runtime)
 - **Sysadmin / net:** PowerToys, Sysinternals Suite, WinSCP, PuTTY, MobaXterm, Tailscale, WireGuard, Mullvad VPN
@@ -45,6 +45,7 @@ Re-running is fine: installed apps are skipped. It then asks (y/n) whether to ru
 - **Claude Code** via its official native installer
 - **PowerShellPerfect** (my own profile)
 - Enables Windows Sandbox, Hyper-V, and WSL2 with Debian as the default distro
+- **System Restore points** at the start and end of the run, so the whole thing can be rolled back from Settings or WinRE (turns on System Protection first if it's off)
 - **System integrity:** a DISM component-store check (auto-repairs with `/RestoreHealth` only if corruption is found) followed by `sfc /scannow`
 - **Disk cleanup** (runs near the end, just before the external tweak tools): DISM component cleanup, the Windows Update download cache, temp folders, and the Recycle Bin
 - **Dual-boot checks (opt-in, y/n):** reports boot entries, Fast Startup, hibernation, hardware-clock (UTC vs local), Secure Boot, and BitLocker, then offers to disable hibernation entirely (`powercfg /h off`, which also clears Fast Startup) and set the clock to UTC
@@ -61,18 +62,31 @@ VS Build Tools and VirtualBox are large; remove those lines if you don't need th
 
 ## Notes
 
-- Reboot after running to finish Sandbox, Hyper-V, and WSL2 (`wsl -l -v` to verify).
-- The external tweak tools (Win11Debloat, Winhance, PowerShellPerfect) only run if you explicitly type `y`, and each runs in its own process.
-- Automatic installers come from the named vendors or projects; review their URLs and current contents before opting in because most are fetched at run time.
-- The bundled `OfficeSetup.exe` is Microsoft's signed setup stub; the script verifies its pinned SHA-256 hash and Microsoft's Authenticode signature before running it. If you ever replace the stub, refresh `$officeSha256` in `setup.ps1` with `Get-FileHash office\OfficeSetup.exe`.
-- Before updating, the script sets winget's `installBehavior.upgradeDelayInDays` to **7** in `settings.json`, so `winget upgrade --all` (and any future upgrade) skips packages released in the last 7 days. This is a **supply-chain safeguard**, not a bug-fix delay: if a publisher is compromised and pushes a malicious release, the window keeps it off the machine long enough for the bad version to be spotted and pulled before it auto-installs. It merges into your existing winget settings rather than overwriting them. Change the `7` in `setup.ps1`, or clear it later with `winget settings`.
-- **ConfigureDefender** is downloaded from AndyFul's official repo and verified (pinned SHA-256 + the author's Authenticode signature) before it's kept, then given a Desktop shortcut. It is never launched or auto-configured — open it and pick a protection level (Default / High / Max) yourself. Refresh `$cdSha256` in `setup.ps1` if AndyFul ships a new build.
-- **Dual-boot** checks are opt-in (y/n) and read-only until you confirm each change. Disabling hibernation (`powercfg /h off`, which also clears Fast Startup) is safe for any dual boot and should be done in *every* Windows install that shares the disk. Setting the hardware clock to UTC is only correct when the other OS uses UTC (Linux/macOS) — leave it off for Windows + Windows. If BitLocker is on, back up your recovery key before touching Secure Boot or firmware settings or you may hit a recovery prompt at boot.
-- Sysmon can also be set up on its own (existing machines, no full setup needed) from an elevated PowerShell: `irm https://github.com/26zl/personal-windows-setup/raw/main/sysmon/install-sysmon.ps1 | iex`. Re-running only reapplies the config. If you replace `sysmon\sysmonconfig-export.xml` (e.g. with a newer SwiftOnSecurity release), refresh `$configSha256` in `install-sysmon.ps1` with `Get-FileHash sysmon\sysmonconfig-export.xml`.
-- Kubernetes runs inside Docker Desktop (enable it in Settings); no separate cluster tooling is installed.
-- Cloud and ops tooling (Ansible, Terraform, and similar) isn't installed by this script; install and run it inside the Debian WSL environment.
-- Java build tools (Maven, Gradle) aren't on winget; install them via Chocolatey or Scoop in a normal shell, or from the Debian WSL.
-- For advanced cybersecurity tooling, see [cybersec-toolkit](https://github.com/26zl/cybersec-toolkit) (580+ Linux/Termux tools; runs from the Debian WSL above).
+- **Reboot when it finishes** to complete Sandbox, Hyper-V, and WSL2 (`wsl -l -v` to verify).
+- **Everything extra is opt-in (y/n):** the tweak tools (Win11Debloat, Winhance, PowerShellPerfect), GitHub sign-in, the Neovim-in-WSL step, and each dual-boot change. Tweak tools each run in their own process.
+- **Most installers are fetched at run time** — review their URLs and contents before you opt in.
+- **Kubernetes** runs inside Docker Desktop (enable it in Settings); no separate cluster tooling is installed.
+- **Not installed here:** cloud/ops tooling (Ansible, Terraform) and Java build tools (Maven, Gradle) — use the Debian WSL, or Chocolatey/Scoop for the Java tools.
+- **More cybersecurity tooling:** [cybersec-toolkit](https://github.com/26zl/cybersec-toolkit) (580+ Linux/Termux tools, runs from the Debian WSL).
+
+<details>
+<summary><strong>Security &amp; supply-chain</strong></summary>
+
+- **`OfficeSetup.exe`** is Microsoft's signed stub; the script verifies its pinned SHA-256 and Authenticode signature before running it. Refresh `$officeSha256` (`Get-FileHash office\OfficeSetup.exe`) if you replace it.
+- **ConfigureDefender** is downloaded from AndyFul's repo, verified (pinned SHA-256 + signature), and given a Desktop shortcut — but never launched. Open it and pick a level (Default / High / Max) yourself; refresh `$cdSha256` for new builds.
+- **winget upgrade delay:** the script sets `installBehavior.upgradeDelayInDays = 7`, so upgrades skip packages released in the last 7 days — a supply-chain safeguard that keeps a compromised release off the machine until it's caught. Change the `7` in `setup.ps1`, or clear it with `winget settings`.
+- **Sysmon on its own** (existing machine, no full run): from an elevated shell, `irm https://github.com/26zl/personal-windows-setup/raw/main/sysmon/install-sysmon.ps1 | iex`. Re-running only reapplies the config; refresh `$configSha256` in `install-sysmon.ps1` if you replace the XML.
+
+</details>
+
+<details>
+<summary><strong>Opt-in steps: dual-boot, GitHub, Neovim</strong></summary>
+
+- **Dual-boot** checks are read-only until you confirm each change. Turning hibernation off (`powercfg /h off`, also clears Fast Startup) is safe for any dual boot. Set the hardware clock to UTC **only** if the other OS is Linux/macOS — not for Windows + Windows. **If BitLocker is on, back up your recovery key** before touching Secure Boot or firmware.
+- **GitHub sign-in** runs `gh auth login --web`, wires git to use `gh` for credentials, and sets your global git identity (login name, `@users.noreply.github.com` when your email is hidden) plus sensible `init.defaultBranch` / `pull.rebase` / `push.autoSetupRemote` defaults.
+- **Neovim** installs my [nvim config](https://github.com/26zl/nvim) into `%LOCALAPPDATA%\nvim` (backs up any existing config; plugins install on first launch) — it needs the C compiler the MSVC toolset provides. It can also set up the same config in WSL Debian; a fresh WSL isn't ready until after a reboot, so re-run for that part.
+
+</details>
 
 ## License
 

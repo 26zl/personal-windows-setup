@@ -45,7 +45,7 @@ if ($localConfig -and (Test-Path $localConfig)) {
     Copy-Item $localConfig $stagedConfig -Force
     Write-Host "    using repo copy: $localConfig" -ForegroundColor DarkGray
 } else {
-    Invoke-WebRequest $configUrl -OutFile $stagedConfig -UseBasicParsing
+    Invoke-WebRequest $configUrl -OutFile $stagedConfig -UseBasicParsing -TimeoutSec 300
     Write-Host "    downloaded from repo" -ForegroundColor DarkGray
 }
 if ((Get-FileHash $stagedConfig -Algorithm SHA256).Hash -ne $configSha256) {
@@ -85,7 +85,7 @@ if ($null -ne $svc) {
         Write-Host "==> downloading standalone Sysmon (no built-in support on this Windows)" -ForegroundColor Cyan
         $zip = Join-Path $env:TEMP 'Sysmon.zip'
         $dir = Join-Path $env:TEMP 'Sysmon-extracted'
-        Invoke-WebRequest 'https://download.sysinternals.com/files/Sysmon.zip' -OutFile $zip -UseBasicParsing
+        Invoke-WebRequest 'https://download.sysinternals.com/files/Sysmon.zip' -OutFile $zip -UseBasicParsing -TimeoutSec 300
         if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
         Expand-Archive $zip -DestinationPath $dir -Force
         $exeName = switch ($env:PROCESSOR_ARCHITECTURE) {
