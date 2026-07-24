@@ -177,7 +177,7 @@ $winget = @(
     # native build toolchains (C/C++, Rust MSVC, native node/python modules)
     'Microsoft.VisualStudio.2022.BuildTools'  # C++ toolset (VCTools workload) added below
     'LLVM.LLVM'
-    'MSYS2.MSYS2'
+    # MSYS2.MSYS2 is installed after this loop (winget can't correlate C:\msys64 - see below)
 
     # package managers
     'pnpm.pnpm'
@@ -232,6 +232,18 @@ $winget = @(
 )
 Write-Host "`n=== winget apps ($($winget.Count)) ===" -ForegroundColor Magenta
 foreach ($pkg in $winget) { Install-App $pkg }
+
+# MSYS2 installs to C:\msys64 via the Qt installer, which returns exit 1 when that directory
+# already exists. winget can't correlate the existing install to the package either, so a plain
+# Install-App retries (and "fails" with 0x8A150006) on every re-run. Treat a working bash.exe
+# there as already installed, the same way Tor Browser and Discord are handled below.
+Write-Host "==> MSYS2.MSYS2" -ForegroundColor Cyan
+if (Test-Path 'C:\msys64\usr\bin\bash.exe') {
+    Write-Host "    already installed (skipped; C:\msys64 present)" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'MSYS2.MSYS2 already installed (C:\msys64)'
+} else {
+    Install-App 'MSYS2.MSYS2'
+}
 
 # Tor Browser
 Write-Host "==> TorProject.TorBrowser" -ForegroundColor Cyan
