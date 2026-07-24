@@ -5,6 +5,8 @@
   Add software by dropping its winget ID into a list below (winget search <name>).
   Re-running skips installed apps; failures are listed at the end. Every run writes a
   full transcript plus a timestamped event log to %LOCALAPPDATA%\windows-setup\logs.
+  On a brand-new machine: run once, REBOOT (to finish Windows features + WSL2), then
+  run again - the second pass completes steps that were waiting on PATH or WSL.
 #>
 
 $ErrorActionPreference = 'Continue'
@@ -166,7 +168,7 @@ $winget = @(
     'Google.PlatformTools'           # Android adb + fastboot
 
     # languages
-    'Python.Python.3.13'
+    'Python.Python.3.14'              # official python.org build (PSF) - not the choco wrapper
     'OpenJS.NodeJS.LTS'               # npm + corepack (yarn/pnpm)
     'GoLang.Go'
     'Rustlang.Rustup'
@@ -175,7 +177,7 @@ $winget = @(
     'RubyInstallerTeam.Ruby.3.4'      # Ruby 3.4
 
     # native build toolchains (C/C++, Rust MSVC, native node/python modules)
-    'Microsoft.VisualStudio.2022.BuildTools'  # C++ toolset (VCTools workload) added below
+    'Microsoft.VisualStudio.BuildTools'       # rolling latest (2022/2026/...); VCTools workload added below
     'LLVM.LLVM'
     # MSYS2.MSYS2 is installed after this loop (winget can't correlate C:\msys64 - see below)
 
@@ -286,26 +288,33 @@ if (-not (Test-Path $vswhere)) {
     } else {
         $btPath = & $vswhere -products 'Microsoft.VisualStudio.Product.BuildTools' -property installationPath 2>$null |
                   Select-Object -First 1
-        if (-not $btPath) { $btPath = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\2022\BuildTools' }
-        Write-Host "==> adding VCTools workload to $btPath (compiler + linker + SDK, multi-GB download)" -ForegroundColor Cyan
-        # no --wait: installer 4.x rejects it (exit 87); Start-Process -Wait blocks instead.
-        # quote the path: Start-Process space-joins its args without quoting.
-        $vsArgs = @(
-            'modify', '--installPath', ('"{0}"' -f $btPath),
-            '--add', 'Microsoft.VisualStudio.Workload.VCTools', '--includeRecommended',
-            '--passive', '--norestart'
-        )
-        $proc = Start-Process $vsSetup -ArgumentList $vsArgs -Wait -PassThru
-        # trust vswhere over the exit code - it reflects what actually got installed
-        $vcNow = & $vswhere -latest -products * -requires $vcComponent -property installationPath 2>$null
-        if ($vcNow) {
-            Write-Host "    MSVC C++ toolset installed (cl.exe, link.exe, CRT, Windows SDK)" -ForegroundColor DarkGray
-            Write-Event 'OK' 'VC++ toolset (VCTools workload) installed'
-            if ($proc.ExitCode -eq 3010) { Write-Host "    reboot required to finish" -ForegroundColor Yellow }
+        if (-not $btPath) {
+            # No hardcoded path: the BuildTools directory tracks the year (2022 -> 2026 -> ...).
+            # If vswhere can't report it, BuildTools isn't ready - re-run after it installs.
+            Write-Host "    BuildTools install path not found via vswhere - skipping VCTools (re-run after BuildTools installs)" -ForegroundColor Yellow
+            Write-Event 'FAIL' 'VC++ toolset - BuildTools installationPath not found via vswhere'
+            $Failed += 'VC++ toolset (BuildTools path not found)'
         } else {
-            Write-Host "    VCTools install failed (exit $($proc.ExitCode)) - component still missing" -ForegroundColor Yellow
-            Write-Event 'FAIL' "VC++ toolset (exit $($proc.ExitCode))"
-            $Failed += 'VC++ toolset (VCTools workload)'
+            Write-Host "==> adding VCTools workload to $btPath (compiler + linker + SDK, multi-GB download)" -ForegroundColor Cyan
+            # no --wait: installer 4.x rejects it (exit 87); Start-Process -Wait blocks instead.
+            # quote the path: Start-Process space-joins its args without quoting.
+            $vsArgs = @(
+                'modify', '--installPath', ('"{0}"' -f $btPath),
+                '--add', 'Microsoft.VisualStudio.Workload.VCTools', '--includeRecommended',
+                '--passive', '--norestart'
+            )
+            $proc = Start-Process $vsSetup -ArgumentList $vsArgs -Wait -PassThru
+            # trust vswhere over the exit code - it reflects what actually got installed
+            $vcNow = & $vswhere -latest -products * -requires $vcComponent -property installationPath 2>$null
+            if ($vcNow) {
+                Write-Host "    MSVC C++ toolset installed (cl.exe, link.exe, CRT, Windows SDK)" -ForegroundColor DarkGray
+                Write-Event 'OK' 'VC++ toolset (VCTools workload) installed'
+                if ($proc.ExitCode -eq 3010) { Write-Host "    reboot required to finish" -ForegroundColor Yellow }
+            } else {
+                Write-Host "    VCTools install failed (exit $($proc.ExitCode)) - component still missing" -ForegroundColor Yellow
+                Write-Event 'FAIL' "VC++ toolset (exit $($proc.ExitCode))"
+                $Failed += 'VC++ toolset (VCTools workload)'
+            }
         }
     }
 }
@@ -775,7 +784,8 @@ if ($Failed.Count -eq 0) {
     Write-Host "These need a manual look:" -ForegroundColor Yellow
     $Failed | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
 }
-Write-Host "Reboot to finish features and WSL2, then verify: Windows features, 'wsl -l -v', and that the tweak tools ran." -ForegroundColor Cyan
+Write-Host "Reboot to finish Windows features + WSL2, then RE-RUN this script to complete any steps that were waiting on PATH/WSL." -ForegroundColor Cyan
+Write-Host "After the reboot, verify: Windows features, 'wsl -l -v', and that the tweak tools ran." -ForegroundColor Cyan
 if ($log) { Write-Host "Transcript: $log" -ForegroundColor DarkGray }
 if ($eventLog) { Write-Host "Event log:  $eventLog" -ForegroundColor DarkGray }
 Write-Host "=====================================================" -ForegroundColor Green
