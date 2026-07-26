@@ -603,6 +603,19 @@ try {
     $Failed += 'ConfigureDefender'
 }
 
+# Optional hardening pass: the settings Harden System Security and ConfigureDefender leave
+# alone. Its own prompts drive it - read-only until each change is confirmed there.
+Write-Host "`n=== Optional hardening (opt in) ===" -ForegroundColor Magenta
+Write-Host "Five ASR rules to Block, NetBIOS off, AutoPlay off, NTLMv2-only, hidden admin shares off, Defender exclusion audit." -ForegroundColor DarkGray
+Write-Host "It reports the current state first and asks before every single change." -ForegroundColor DarkGray
+if ((Read-Host "Run the optional hardening pass? Type y (anything else skips)") -match '^(y|yes)$') {
+    Invoke-Child "& ([scriptblock]::Create((Invoke-RestMethod https://github.com/26zl/personal-windows-setup/raw/main/hardening/harden-extras.ps1)))"
+    Write-Event 'INFO' 'optional hardening pass ran (its own prompts decided what was applied)'
+} else {
+    Write-Host "    skipped optional hardening" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'optional hardening skipped by user'
+}
+
 # Claude Code - the native installer keeps itself updated, so only run it when claude is missing.
 Write-Host "`n=== Claude Code (official native installer) ===" -ForegroundColor Magenta
 $claudeExe = Join-Path $env:USERPROFILE '.local\bin\claude.exe'

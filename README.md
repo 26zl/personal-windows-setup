@@ -38,6 +38,7 @@ Re-running is fine: installed apps are skipped. It then asks (y/n) whether to ru
 - **Sysadmin / net:** PowerToys, Sysinternals Suite, WinSCP, PuTTY, MobaXterm, Tailscale, WireGuard, Mullvad VPN
 - **Cybersec:** Wireshark, Nmap, Burp Suite Community, KeePassXC, ConfigureDefender (Defender settings GUI — installed & signature-verified only, never auto-configured)
 - **Sysmon:** system activity logging to the event log — built-in Sysmon on Windows 11 24H2+ (enables the optional feature if needed), signature-checked Sysinternals download on older Windows, configured with a pinned [SwiftOnSecurity config](sysmon/sysmonconfig-export.xml) and a 512 MB log
+- **Optional hardening pass (opt-in, y/n):** the handful of settings [Harden System Security](https://github.com/HotCakeX/Harden-Windows-Security) and ConfigureDefender leave alone — five ASR rules moved to Block (exploited vulnerable signed drivers, copied system tools, unsigned processes from USB, LSASS credential theft, Safe Mode reboot), NetBIOS over TCP/IP off on every interface, AutoPlay/AutoRun disabled by policy, NTLM restricted to v2 only, the hidden admin shares (`C$`, `ADMIN$`) turned off, and an audit of any Defender exclusions. It reports the current state first, asks before each change, and skips whatever is already applied
 - **Browser:** Google Chrome, Tor Browser
 - **Cleanup / maintenance:** Malwarebytes, AdwCleaner, BleachBit, DriverStore Explorer
 - **Utilities:** Rufus, balenaEtcher, Steam, Windows Notepad (Store)
@@ -63,7 +64,7 @@ VS Build Tools and VirtualBox are large; remove those lines if you don't need th
 ## Notes
 
 - **Reboot when it finishes** to complete Sandbox, Hyper-V, and WSL2 (`wsl -l -v` to verify).
-- **Everything extra is opt-in (y/n):** the tweak tools (Win11Debloat, Winhance, PowerShellPerfect), GitHub sign-in, the Neovim-in-WSL step, and each dual-boot change. Tweak tools each run in their own process.
+- **Everything extra is opt-in (y/n):** the tweak tools (Win11Debloat, Winhance, PowerShellPerfect), GitHub sign-in, the Neovim-in-WSL step, the hardening pass and each change inside it, and each dual-boot change. Tweak tools each run in their own process.
 - **Most installers are fetched at run time** — review their URLs and contents before you opt in.
 - **Kubernetes** runs inside Docker Desktop (enable it in Settings); no separate cluster tooling is installed.
 - **Not installed here:** cloud/ops tooling (Ansible, Terraform) and Java build tools (Maven, Gradle) — use the Debian WSL, or Chocolatey/Scoop for the Java tools.
@@ -76,6 +77,7 @@ VS Build Tools and VirtualBox are large; remove those lines if you don't need th
 - **ConfigureDefender** is downloaded from AndyFul's repo, verified (pinned SHA-256 + signature), and given a Desktop shortcut — but never launched. Open it and pick a level (Default / High / Max) yourself; refresh `$cdSha256` for new builds.
 - **winget upgrade delay:** the script sets `installBehavior.upgradeDelayInDays = 7`, so upgrades skip packages released in the last 7 days — a supply-chain safeguard that keeps a compromised release off the machine until it's caught. Change the `7` in `setup.ps1`, or clear it with `winget settings`.
 - **Sysmon on its own** (existing machine, no full run): from an elevated shell, `irm https://github.com/26zl/personal-windows-setup/raw/main/sysmon/install-sysmon.ps1 | iex`. Re-running only reapplies the config; refresh `$configSha256` in `install-sysmon.ps1` if you replace the XML.
+- **Hardening on its own** (existing machine, no full run): from an elevated shell, `irm https://github.com/26zl/personal-windows-setup/raw/main/hardening/harden-extras.ps1 | iex`. It stays read-only until you answer `y` to a specific change, and [`harden-extras.ps1`](hardening/harden-extras.ps1) documents how to undo every one of them in its header. Two are worth a thought before you accept them: NTLMv2-only breaks authentication to gear old enough to speak NTLMv1, and turning off the admin shares breaks backup or remote-admin tools that reach `\\host\C$`. Re-run it after Harden System Security, which manages some ASR rules through policy and can put them back — the script writes to the policy key when a rule lives there, because `Add-MpPreference` is silently overridden in that case.
 
 </details>
 
