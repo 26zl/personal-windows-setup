@@ -68,6 +68,20 @@ param(
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
+# Evidence comes from Windows, and on a non-English installation that text carries
+# characters the console's default code page cannot render. A Norwegian update title
+# came back as "Defender Antivirus a EUR" instead of an en dash, which makes the finding
+# look corrupted and, worse, unsearchable. This is process-scoped - it changes the
+# encoding of this PowerShell host's output stream and nothing on the machine - and it is
+# wrapped because a redirected or non-interactive host has no console to configure.
+try {
+    if ([Console]::OutputEncoding.CodePage -ne 65001) {
+        [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    }
+} catch {
+    Write-Verbose -Message 'Console output encoding could not be set; non-ASCII evidence may render incorrectly.'
+}
+
 # state
 
 $script:Findings = New-Object System.Collections.ArrayList
@@ -946,22 +960,13 @@ function Test-SystemHealth {
                 -Confidence Likely
         }
         elseif ($totalBytes -gt 0) {
+            # Free space is judged once, in the Storage category, which grades every volume
+            # against the same thresholds. Reporting it here as well produced two findings
+            # for one fact on a machine that was actually short of space - a Critical from
+            # Storage and a High from System, worded differently, both about the same drive.
+            # The healthy line stays, because it names the file system as well.
             $freePct = [math]::Round(($freeBytes / $totalBytes) * 100, 1)
-            if ($freePct -lt 5 -or $freeBytes -lt 5GB) {
-                Add-Finding -Severity High -Title 'Critically low free space on the system drive' `
-                    -Evidence "$sysDriveLetter`: has $(Format-Size -Bytes $freeBytes) free of $(Format-Size -Bytes $totalBytes), that is $freePct percent." `
-                    -Impact 'Windows Update fails, the page file cannot grow, and the machine can become unstable or refuse to start.' `
-                    -Fix 'Settings > System > Storage > Storage Sense, or Disk Cleanup (cleanmgr).' `
-                    -Confidence Certain
-            }
-            elseif ($freePct -lt 15) {
-                Add-Finding -Severity Medium -Title 'Low free space on the system drive' `
-                    -Evidence "$sysDriveLetter`: has $(Format-Size -Bytes $freeBytes) free of $(Format-Size -Bytes $totalBytes), that is $freePct percent." `
-                    -Impact 'Feature updates often need 20 GB temporarily, and low free space slows down both the SSD and the page file.' `
-                    -Fix 'Settings > System > Storage, and turn on Storage Sense.' `
-                    -Confidence Likely
-            }
-            else {
+            if ($freePct -ge 15) {
                 Add-Ok -Message "System drive $sysDriveLetter`: is NTFS with $(Format-Size -Bytes $freeBytes) free, that is $freePct percent."
             }
         }
@@ -4881,11 +4886,21 @@ function Test-NetworkHealth {
             } catch {
                 Write-Verbose -Message ("Get-NetAdapter unavailable, GUIDs will be shown instead: {0}" -f $_.Exception.Message)
             }
+            # NetBT keeps an interface key long after the adapter is gone, so the registry is
+            # full of GUIDs for hardware that was removed years ago. Those cannot broadcast
+            # anything. Reporting them turned this finding into a wall of GUIDs on a machine
+            # with a normal history, which buries the one adapter that actually mattered.
+            $nbtStale = 0
             foreach ($nbtKey in $nbtKeys) {
                 $option = Get-RegValue -Path $nbtKey.PSPath -Name 'NetbiosOptions'
                 # 0 = follow DHCP (in practice on), 1 = on, 2 = off.
                 if ($null -ne $option -and [int]$option -eq 2) { continue }
                 $guid = $nbtKey.PSChildName -replace '^Tcpip_', ''
+                if (-not $adapterNames.ContainsKey($guid)) {
+                    # Only skip it when the adapter list was actually readable - otherwise
+                    # every interface would look stale and the check would report nothing.
+                    if ($adapterNames.Count -gt 0) { $nbtStale++; continue }
+                }
                 $label = if ($adapterNames.ContainsKey($guid)) { $adapterNames[$guid] } else { $guid }
                 $value = if ($null -eq $option) { 'not set' } else { "$option" }
                 $nbtEnabled += "$label (NetbiosOptions=$value)"
@@ -4899,8 +4914,9 @@ function Test-NetworkHealth {
     if (-not $nbtChecked) {
         Add-Skip -Message ("Could not read {0} - skipping the NetBIOS over TCP/IP check." -f $nbtRoot)
     } elseif ($nbtEnabled.Count -gt 0) {
+        $staleNote = if ($nbtStale -gt 0) { " ($nbtStale further NetBT entries belong to adapters that no longer exist and were ignored.)" } else { '' }
         Add-Finding -Severity 'Low' -Title 'NetBIOS over TCP/IP is not turned off' `
-            -Evidence ((@($nbtEnabled | Select-Object -First 6) -join '; ')) `
+            -Evidence ((@($nbtEnabled | Select-Object -First 6) -join '; ') + $staleNote) `
             -Impact 'When a DNS lookup fails, the machine broadcasts the name it is after on the local network (NBT-NS). Anyone on the same network can answer "that is me" and get the machine to send its NTLM logon there - the basis for tools like Responder.' `
             -Fix 'Per adapter: Network Connections > Properties > Internet Protocol Version 4 > Advanced > WINS > "Disable NetBIOS over TCP/IP". Virtual switch adapters (Hyper-V, WSL) do not appear there - set NetbiosOptions to 2 directly under HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces\Tcpip_<GUID>. Check afterwards with: Get-NetTCPConnection -LocalPort 139 -State Listen' `
             -Confidence 'Certain'
@@ -5233,7 +5249,14 @@ function Test-NetworkHealth {
     # File shares. Inferring "not sharing" from port 445 was wrong in both directions:
     # the port is open on almost every Windows machine, and a share can exist behind it.
     try {
-        $shares = @(Get-SmbShare -ErrorAction Stop | Where-Object { $_.Name -notmatch '^\w\$$' -and $_.Name -ne 'IPC$' })
+        # The built-in administrative shares, which every Windows machine publishes and which
+        # are not a finding: the per-drive C$/D$ ones, plus the fixed-name ADMIN$, IPC$ and
+        # print$. The old filter only matched a single letter before the $, so ADMIN$ was
+        # reported as a published share on every machine that had it.
+        $builtinShares = @('ADMIN$', 'IPC$', 'PRINT$', 'FAX$')
+        $shares = @(Get-SmbShare -ErrorAction Stop | Where-Object {
+                $_.Name -notmatch '^\w\$$' -and $builtinShares -notcontains $_.Name.ToUpperInvariant()
+            })
         if ($shares.Count -eq 0) {
             Add-Ok -Message 'No file shares beyond the built-in administrative ones are published from this machine.'
         } else {
@@ -6824,19 +6847,28 @@ function Test-SecurityHealth {
     # machine has the protection turned on in the interface while not having it at all.
     try {
         $deviceGuard = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction Stop
-        $configured = @($deviceGuard.SecurityServicesConfigured)
-        $running = @($deviceGuard.SecurityServicesRunning)
+        # Both properties report 0 to mean "none", as a single-element array rather than an
+        # empty one. Left in, that 0 counts as a configured service that is also running, so
+        # a machine with nothing enabled got told "every configured protection is running (0)"
+        # - a healthy line about a list that does not exist.
+        $configured = @($deviceGuard.SecurityServicesConfigured | Where-Object { [int]$_ -ne 0 })
+        $running = @($deviceGuard.SecurityServicesRunning | Where-Object { [int]$_ -ne 0 })
         $serviceNames = @{ 1 = 'Credential Guard'; 2 = 'Memory integrity (HVCI)'; 3 = 'System Guard'; 4 = 'SMM firmware measurement'; 5 = 'Kernel-mode hardware-enforced stack protection' }
         $notRunning = @($configured | Where-Object { $running -notcontains $_ })
-        if ($notRunning.Count -gt 0) {
+        if ($configured.Count -eq 0) {
+            # Nothing requested. Whether that is a problem is the Credential Guard and HVCI
+            # checks' job, not this one - this only compares intent against reality.
+            Add-Skip -Message 'No virtualization-based protection is configured, so there was nothing to compare against what is running.'
+        } elseif ($notRunning.Count -gt 0) {
             $notRunningText = (@($notRunning | ForEach-Object { if ($serviceNames.ContainsKey([int]$_)) { $serviceNames[[int]$_] } else { "service $_" } }) -join ', ')
             Add-Finding -Severity Medium -Title 'A virtualization-based protection is configured but not running' `
                 -Evidence ("SecurityServicesConfigured = [{0}], SecurityServicesRunning = [{1}]. Not running: {2}. VirtualizationBasedSecurityStatus = {3}." -f ($configured -join ', '), ($running -join ', '), $notRunningText, $deviceGuard.VirtualizationBasedSecurityStatus) `
                 -Impact 'The setting is on in Windows Security, but the hypervisor never started the service. The usual cause is an incompatible kernel driver - often from an old VPN client, an anti-cheat, or a virtualization product - which leaves the machine with the protection switched on and absent at the same time.' `
                 -Fix 'Find the blocking driver: the System log, source Microsoft-Windows-DeviceGuard, records why. Windows Security > Device security > Core isolation details also names incompatible drivers. Update or remove that driver and restart.' `
                 -Confidence Certain
-        } elseif ($configured.Count -gt 0) {
-            Add-Ok -Message ("Every configured virtualization-based protection is actually running ({0})." -f ($configured -join ', '))
+        } else {
+            $runningText = (@($configured | ForEach-Object { if ($serviceNames.ContainsKey([int]$_)) { $serviceNames[[int]$_] } else { "service $_" } }) -join ', ')
+            Add-Ok -Message ("Every virtualization-based protection that is configured is actually running: {0}." -f $runningText)
         }
     } catch {
         Add-Skip -Message 'Win32_DeviceGuard could not be read, so configured-versus-running VBS state was not compared.'
@@ -9104,18 +9136,24 @@ function Test-SoftwareHealth {
     $riskyHits = 0
     foreach ($rule in $riskyRules) {
         $ruleHits = @($programs | Where-Object { $_.Name -match $rule.Pattern })
+        # One finding per rule, not per matching program. The x86 and x64 Visual C++ 2008
+        # runtimes are two rows in the registry and one fact about the machine, and emitting
+        # them separately put two findings with an identical title next to each other in the
+        # report. Same for a machine carrying several old Java installs.
+        $ruleEvidence = @()
+        $ruleConfidence = $rule.Confidence
         foreach ($hit in $ruleHits) {
             $hitVersion = & $toVersion $hit.Version
             if ($null -eq $hitVersion) { $hitVersion = & $toVersion $hit.Name }
 
-            $hitConfidence = $rule.Confidence
             if ($null -ne $rule.Below) {
                 if ($null -ne $hitVersion) {
                     if ($hitVersion -ge $rule.Below) { continue }
                 } else {
                     # Without a readable version we cannot assert the install is actually too old,
-                    # so the finding drops to Uncertain instead of being overstated.
-                    $hitConfidence = 'Uncertain'
+                    # so the finding drops to Uncertain instead of being overstated. One unreadable
+                    # version among several is enough to soften the whole finding.
+                    $ruleConfidence = 'Uncertain'
                 }
             }
 
@@ -9123,15 +9161,18 @@ function Test-SoftwareHealth {
             if ([string]::IsNullOrWhiteSpace($shownVersion)) { $shownVersion = 'no version given in the registry' }
             $shownPublisher = $hit.Publisher
             if ([string]::IsNullOrWhiteSpace($shownPublisher)) { $shownPublisher = 'unknown publisher' }
-
-            $riskyHits++
-            Add-Finding -Severity $rule.Severity `
-                -Title $rule.Title `
-                -Evidence "$($hit.Name), version $shownVersion, publisher $shownPublisher ($($hit.Hive))." `
-                -Impact $rule.Why `
-                -Fix $rule.Fix `
-                -Confidence $hitConfidence
+            $ruleEvidence += "$($hit.Name), version $shownVersion, publisher $shownPublisher ($($hit.Hive))"
         }
+
+        if ($ruleEvidence.Count -eq 0) { continue }
+        $riskyHits += $ruleEvidence.Count
+        $ruleTitle = if ($ruleEvidence.Count -gt 1) { "$($rule.Title) - $($ruleEvidence.Count) installations" } else { $rule.Title }
+        Add-Finding -Severity $rule.Severity `
+            -Title $ruleTitle `
+            -Evidence (($ruleEvidence | Select-Object -First 6) -join '; ') `
+            -Impact $rule.Why `
+            -Fix $rule.Fix `
+            -Confidence $ruleConfidence
     }
 
     if ($riskyHits -eq 0) {
