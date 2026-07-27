@@ -8,6 +8,65 @@ permissions:
   contents: read
 
 jobs:
+  # These scripts only ever run on Windows, and several of the things that break them
+  # are Windows-only: Windows PowerShell 5.1 parses a few constructs differently from
+  # PowerShell 7, and the Windows-only cmdlets the scripts call do not exist on Linux.
+  # Ubuntu alone would pass while 5.1 fails on a user's machine.
+  pester:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Run Pester contract tests
+        shell: pwsh
+        run: |
+          Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -SkipPublisherCheck
+          Import-Module Pester -MinimumVersion 5.0
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = './healthcheck'
+          $cfg.Output.Verbosity = 'Detailed'
+          $cfg.Run.Exit = $true
+          Invoke-Pester -Configuration $cfg
+
+  # Windows PowerShell 5.1 is the shell a fresh Windows install opens by default, so
+  # every script has to parse there too. This checks parsing and the contract tests
+  # under 5.1 specifically - pwsh above does not cover it.
+  windows-powershell-5:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Parse every script under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $failed = $false
+          Get-ChildItem . -Recurse -Filter *.ps1 | ForEach-Object {
+            $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName, [ref]$null, [ref]$errors)
+            if ($errors) {
+              $failed = $true
+              Write-Host "::error file=$($_.Name)::$($errors[0].Message) (line $($errors[0].Extent.StartLineNumber))"
+            } else {
+              Write-Host "OK  $($_.Name)"
+            }
+          }
+          if ($failed) { exit 1 }
+      - name: Run Pester contract tests under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -SkipPublisherCheck
+          Import-Module Pester -MinimumVersion 5.0
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = './healthcheck'
+          $cfg.Output.Verbosity = 'Detailed'
+          $cfg.Run.Exit = $true
+          Invoke-Pester -Configuration $cfg
+
   psscriptanalyzer:
     runs-on: ubuntu-latest
     timeout-minutes: 10

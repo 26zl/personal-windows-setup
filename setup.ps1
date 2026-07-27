@@ -47,10 +47,13 @@ $Failed = @()
 $WingetOk = 0, -1978335189, -1978335135
 
 function Install-App {
+    # --no-upgrade keeps a re-run additive: without it winget silently upgrades packages
+    # that are already installed, which would move versions before the user has been
+    # asked about "winget upgrade --all" at the end of the run.
     param([string]$Id, [string]$Source = 'winget')
     Write-Host "==> $Id" -ForegroundColor Cyan
-    winget install --id $Id --exact --source $Source --silent --accept-source-agreements --accept-package-agreements
-    if ($LASTEXITCODE -eq 0) { Write-Event 'OK' "$Id installed or updated"; return }
+    winget install --id $Id --exact --source $Source --silent --no-upgrade --accept-source-agreements --accept-package-agreements
+    if ($LASTEXITCODE -eq 0) { Write-Event 'OK' "$Id installed" ; return }
     if ($WingetOk -contains $LASTEXITCODE) { Write-Event 'SKIP' "$Id already installed (exit $LASTEXITCODE)"; return }
     Write-Host "    FAILED: $Id (exit $LASTEXITCODE)" -ForegroundColor Yellow
     Write-Event 'FAIL' "$Id (exit $LASTEXITCODE)"
@@ -77,38 +80,6 @@ function Invoke-Tool {
     else { Write-Event 'OK' "$Name completed" }
 }
 
-function Set-WingetUpgradeDelay {
-    [CmdletBinding(SupportsShouldProcess)]
-    param([int]$Days = 7)
-    # Hold winget upgrades for packages newer than $Days days (supply-chain soak). settings.json
-    # is JSONC, so strip comments/trailing commas before parsing and merge into existing settings.
-    $schemaUrl = 'https://aka.ms/winget-settings.schema.json'
-    $path = $null
-    try { $path = (winget settings export 2>$null | ConvertFrom-Json).userSettingsFile } catch { $path = $null }
-    if (-not $path) { $path = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\settings.json' }
-    try {
-        $obj = $null
-        $raw = if (Test-Path $path) { Get-Content $path -Raw } else { $null }
-        if ($raw -and $raw.Trim()) {
-            $clean = [regex]::Replace($raw, '("(?:\\.|[^"\\])*")|/\*[\s\S]*?\*/|//[^\r\n]*', '$1')
-            $clean = [regex]::Replace($clean, ',(?=\s*[}\]])', '')
-            $obj   = $clean | ConvertFrom-Json
-        }
-        if ($null -eq $obj) { $obj = [pscustomobject]@{ '$schema' = $schemaUrl } }
-        if ($null -eq $obj.installBehavior) { $obj | Add-Member -NotePropertyName installBehavior -NotePropertyValue ([pscustomobject]@{}) -Force }
-        $obj.installBehavior | Add-Member -NotePropertyName upgradeDelayInDays -NotePropertyValue $Days -Force
-        if ($PSCmdlet.ShouldProcess($path, "set upgradeDelayInDays=$Days")) {
-            $null = New-Item (Split-Path $path) -ItemType Directory -Force
-            [IO.File]::WriteAllText($path, ($obj | ConvertTo-Json -Depth 10), (New-Object Text.UTF8Encoding($false)))
-            Write-Host "    upgradeDelayInDays = $Days (supply-chain soak: skips packages newer than $Days days)" -ForegroundColor DarkGray
-            Write-Event 'OK' "winget upgradeDelayInDays set to $Days"
-        }
-    } catch {
-        Write-Host "    could not set upgradeDelayInDays: $($_.Exception.Message)" -ForegroundColor Yellow
-        Write-Host "    left settings.json untouched - set it yourself via 'winget settings'" -ForegroundColor DarkGray
-        Write-Event 'WARN' "winget upgradeDelayInDays not set - $($_.Exception.Message)"
-    }
-}
 
 function New-SetupRestorePoint {
     [CmdletBinding(SupportsShouldProcess)]
@@ -196,6 +167,8 @@ $winget = @(
 
     # ai / local llm
     'Ollama.Ollama'                   # local LLM runtime (listens on localhost:11434)
+    # Nvidia.CUDA is not in this list - it is several GB and useless without an NVIDIA
+    # GPU, so it is installed further down only when one is actually present.
 
     # sysadmin / networking
     'Microsoft.PowerToys'
@@ -234,6 +207,19 @@ $winget = @(
 )
 Write-Host "`n=== winget apps ($($winget.Count)) ===" -ForegroundColor Magenta
 foreach ($pkg in $winget) { Install-App $pkg }
+
+# CUDA toolkit: several GB, and it does nothing without an NVIDIA GPU. Gate it on the
+# hardware rather than shipping that download to every machine that runs this script.
+Write-Host "`n=== CUDA toolkit (NVIDIA GPU only) ===" -ForegroundColor Magenta
+$nvidiaGpu = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '(?i)nvidia' -or $_.AdapterCompatibility -match '(?i)nvidia' })
+if ($nvidiaGpu.Count -gt 0) {
+    Write-Host "    found $($nvidiaGpu[0].Name)" -ForegroundColor DarkGray
+    Install-App 'Nvidia.CUDA'
+} else {
+    Write-Host "    no NVIDIA GPU detected - skipping the CUDA toolkit (several GB, no use without one)" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'Nvidia.CUDA skipped - no NVIDIA GPU present'
+}
 
 # MSYS2 installs to C:\msys64 via the Qt installer, which returns exit 1 when that directory
 # already exists. winget can't correlate the existing install to the package either, so a plain
@@ -393,14 +379,20 @@ if ($sysDir) {
     Write-Host "    Sysinternals : folder not found (skipped)" -ForegroundColor DarkGray
 }
 
+# Scoop's installer is fetched from get.scoop.sh and cannot be hash-pinned - upstream
+# changes it. Since it runs elevated, it gets the same y/n gate as the other unpinned
+# third-party scripts rather than running unannounced.
 Write-Host "`n=== Scoop ===" -ForegroundColor Magenta
 if (Get-Command scoop -ErrorAction SilentlyContinue) {
     Write-Host "    already installed" -ForegroundColor DarkGray
     Write-Event 'SKIP' 'Scoop already installed'
-} else {
+} elseif ((Read-Host "Install Scoop? It runs an unpinned script from get.scoop.sh as Administrator. Type y (anything else skips)") -match '^(y|yes)$') {
     Invoke-Child "& ([scriptblock]::Create((Invoke-RestMethod https://get.scoop.sh))) -RunAsAdmin"
     if ($LASTEXITCODE -ne 0) { Write-Host "    Scoop reported exit $LASTEXITCODE" -ForegroundColor Yellow; Write-Event 'FAIL' "Scoop (exit $LASTEXITCODE)"; $Failed += 'Scoop' }
     else { Write-Event 'OK' 'Scoop installed' }
+} else {
+    Write-Host "    skipped Scoop" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'Scoop skipped by user'
 }
 
 Write-Host "`n=== pipx ===" -ForegroundColor Magenta
@@ -527,8 +519,26 @@ if ($osCaption -match 'Home') {
     Write-Event 'SKIP' 'Sandbox + Hyper-V skipped (Windows Home)'
 } else {
     foreach ($f in 'Containers-DisposableClientVM','Microsoft-Hyper-V-All') {
-        $info = dism.exe /online /get-featureinfo "/featurename:$f" 2>&1 | Out-String
-        if ($info -match 'State\s*:\s*Enable') {
+        # Win32_OptionalFeature reports InstallState as a number (1 = Enabled), so the
+        # comparison holds on any display language. Two alternatives were rejected:
+        # matching dism.exe output against "State : Enabled" breaks on a localized Windows
+        # and re-enables the feature on every run, and Get-WindowsOptionalFeature comes
+        # from the DISM module, which throws "Class not registered" under PowerShell 7.
+        $featureState = $null
+        try {
+            $optionalFeature = Get-CimInstance -ClassName Win32_OptionalFeature -Filter "Name='$f'" -ErrorAction Stop
+            if ($optionalFeature) {
+                $featureState = switch ([int]$optionalFeature.InstallState) {
+                    1       { 'Enabled' }
+                    2       { 'Disabled' }
+                    3       { 'Absent' }
+                    default { $null }
+                }
+            }
+        } catch {
+            Write-Host "    could not read the state of $f ($($_.Exception.Message)) - trying to enable it" -ForegroundColor DarkGray
+        }
+        if ($featureState -eq 'Enabled') {
             Write-Host "    $f already enabled" -ForegroundColor DarkGray
             Write-Event 'SKIP' "feature $f already enabled"
             continue
@@ -578,17 +588,21 @@ $cdExe = Join-Path $cdDir 'ConfigureDefender.exe'
 $cdUrl = 'https://github.com/AndyFul/ConfigureDefender/raw/master/ConfigureDefender.exe'
 # pinned hash of AndyFul's signed build; refresh with Get-FileHash if he ships a new one
 $cdSha256 = 'BD7630B6AD94F8ED2024E5E98A24B6FEDBB5F2B8A058B70C8FFEEFE98A7DCCA2'
+# Download to a unique staging file and only move it into place once the hash and the
+# signature both check out. Writing straight to $cdExe would leave a rejected binary at
+# the path the Desktop shortcut from an earlier run already points at.
+$cdStaging = Join-Path $cdDir ("ConfigureDefender.{0}.download" -f [guid]::NewGuid().ToString('N'))
 try {
     $null = New-Item $cdDir -ItemType Directory -Force
-    Invoke-WebRequest $cdUrl -OutFile $cdExe -UseBasicParsing -TimeoutSec 300
-    # verify the pinned hash + the author's Authenticode signature before keeping it
-    if ((Get-FileHash $cdExe -Algorithm SHA256).Hash -ne $cdSha256) {
+    Invoke-WebRequest $cdUrl -OutFile $cdStaging -UseBasicParsing -TimeoutSec 300
+    if ((Get-FileHash $cdStaging -Algorithm SHA256).Hash -ne $cdSha256) {
         throw 'SHA256 mismatch - refresh $cdSha256 if AndyFul published a new build'
     }
-    $sig = Get-AuthenticodeSignature $cdExe
+    $sig = Get-AuthenticodeSignature $cdStaging
     if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Andrzej Pluta') {
         throw "signature check failed (status $($sig.Status))"
     }
+    Move-Item $cdStaging $cdExe -Force
     if (-not $desktop) { $desktop = [Environment]::GetFolderPath('Desktop') }
     if (-not $shell)   { $shell   = New-Object -ComObject WScript.Shell }
     $lnk = $shell.CreateShortcut((Join-Path $desktop 'ConfigureDefender.lnk'))
@@ -601,6 +615,9 @@ try {
     Write-Host "    ConfigureDefender failed: $($_.Exception.Message)" -ForegroundColor Yellow
     Write-Event 'FAIL' "ConfigureDefender - $($_.Exception.Message)"
     $Failed += 'ConfigureDefender'
+} finally {
+    # never leave a rejected or half-written download on disk
+    if (Test-Path $cdStaging) { Remove-Item $cdStaging -Force -ErrorAction SilentlyContinue }
 }
 
 # Optional hardening pass: the settings Harden System Security and ConfigureDefender leave
@@ -630,14 +647,52 @@ if ((Get-Command claude -ErrorAction SilentlyContinue) -or (Test-Path $claudeExe
 
 # System integrity: DISM first (repairs the component store), then SFC (uses it).
 Write-Host "`n=== System integrity (DISM + SFC) ===" -ForegroundColor Magenta
-Write-Host "==> DISM /ScanHealth (checking the component store - can take a few minutes)" -ForegroundColor Cyan
-$dismScan = dism.exe /online /cleanup-image /scanhealth 2>&1 | Out-String
-$scanExit = $LASTEXITCODE
-($dismScan -split "`r?`n" | Where-Object { $_ -match '\S' } | Select-Object -Last 2) |
-    ForEach-Object { Write-Host "    $($_.Trim())" -ForegroundColor DarkGray }
-if ($scanExit -eq 0 -and $dismScan -match 'No component store corruption detected') {
+Write-Host "==> ScanHealth (checking the component store - can take a few minutes)" -ForegroundColor Cyan
+# Repair-WindowsImage rather than dism.exe: it returns ImageHealthState as an enum
+# (Healthy / Repairable / NonRepairable), so the result does not depend on the display
+# language. Matching dism.exe output against "No component store corruption detected"
+# fails on every non-English Windows and would send those machines into RestoreHealth
+# on every single run.
+# The catch: DISM is a Windows PowerShell module and throws "Class not registered" under
+# PowerShell 7, so the cmdlet existing says nothing about it working. Try it in-process,
+# then through Windows PowerShell, and only then fall back to reading dism.exe text.
+$storeHealthy = $false
+$scanReported = $false
+$scanState = $null
+try {
+    $scanState = [string](Repair-WindowsImage -Online -ScanHealth -ErrorAction Stop).ImageHealthState
+}
+catch {
+    Write-Host "    Repair-WindowsImage unavailable here ($($_.Exception.Message))" -ForegroundColor DarkGray
+    $winPs = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (Test-Path $winPs) {
+        Write-Host "    retrying through Windows PowerShell" -ForegroundColor DarkGray
+        try {
+            $raw = & $winPs -NoProfile -NonInteractive -Command `
+                '(Repair-WindowsImage -Online -ScanHealth -ErrorAction Stop).ImageHealthState' 2>$null
+            if ($LASTEXITCODE -eq 0) { $scanState = ([string]$raw).Trim() }
+        } catch {
+            Write-Host "    Windows PowerShell attempt failed too" -ForegroundColor DarkGray
+        }
+    }
+}
+if ($scanState) {
+    $storeHealthy = ($scanState -eq 'Healthy')
+    $scanReported = $true
+    Write-Host "    ImageHealthState: $scanState" -ForegroundColor DarkGray
+}
+if (-not $scanReported) {
+    $dismScan = dism.exe /online /cleanup-image /scanhealth 2>&1 | Out-String
+    $scanExit = $LASTEXITCODE
+    ($dismScan -split "`r?`n" | Where-Object { $_ -match '\S' } | Select-Object -Last 2) |
+        ForEach-Object { Write-Host "    $($_.Trim())" -ForegroundColor DarkGray }
+    # Without the cmdlet there is no language-independent signal, so fall back to the
+    # English string and accept that a localized Windows takes the repair path.
+    $storeHealthy = ($scanExit -eq 0 -and $dismScan -match 'No component store corruption detected')
+}
+if ($storeHealthy) {
     Write-Host "    component store is healthy" -ForegroundColor DarkGray
-    Write-Event 'OK' 'DISM ScanHealth - no corruption'
+    Write-Event 'OK' 'ScanHealth - no corruption'
 } else {
     Write-Host "==> corruption indicated - DISM /RestoreHealth (may download from Windows Update)" -ForegroundColor Cyan
     dism.exe /online /cleanup-image /restorehealth
@@ -729,9 +784,6 @@ if ((Read-Host "Check dual-boot settings? Type y (anything else skips)") -match 
     Write-Event 'SKIP' 'dual-boot checks skipped by user'
 }
 
-# winget update policy: hold back packages released in the last 7 days (supply-chain soak).
-Write-Host "`n=== winget update policy ===" -ForegroundColor Magenta
-Set-WingetUpgradeDelay -Days 7
 
 # Update installed apps (opt in)
 Write-Host "`n=== Update installed apps (opt in) ===" -ForegroundColor Magenta
@@ -745,33 +797,62 @@ if ((Read-Host "Update all installed apps now? (winget upgrade --all) Type y (an
 }
 
 # Disk cleanup: superseded components, Windows Update cache, temp folders, Recycle Bin.
-Write-Host "`n=== Disk cleanup ===" -ForegroundColor Magenta
-$freeBefore = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'").FreeSpace
-# 1) component store: drop superseded update payloads
-Write-Host "==> DISM /StartComponentCleanup" -ForegroundColor Cyan
-dism.exe /online /cleanup-image /startcomponentcleanup | Out-Null
-if ($LASTEXITCODE -ne 0) { Write-Host "    component cleanup exit $LASTEXITCODE (continuing)" -ForegroundColor DarkGray }
-# 2) Windows Update download cache
-Write-Host "==> Windows Update cache" -ForegroundColor Cyan
-try {
-    Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
-    $wuCache = Join-Path $env:SystemRoot 'SoftwareDistribution\Download'
-    if (Test-Path $wuCache) { Get-ChildItem $wuCache -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue }
-    Start-Service wuauserv -ErrorAction SilentlyContinue
-} catch { Write-Host "    update-cache step skipped ($($_.Exception.Message))" -ForegroundColor DarkGray }
-# 3) temp folders (anything a running process holds open is skipped)
-Write-Host "==> temp folders" -ForegroundColor Cyan
-foreach ($t in @($env:TEMP, (Join-Path $env:SystemRoot 'Temp'))) {
-    if ($t -and (Test-Path $t)) { Get-ChildItem $t -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue }
+# Opt in, because none of it can be undone. Emptying the Recycle Bin destroys whatever the
+# user has deleted but not yet decided about, and clearing TEMP takes installer payloads,
+# half-finished downloads and application scratch files with it. System Restore does not
+# bring any of that back - it only covers system files, the registry and program installs.
+Write-Host "`n=== Disk cleanup (opt in) ===" -ForegroundColor Magenta
+Write-Host "Removes superseded update components, the Windows Update download cache, both TEMP" -ForegroundColor DarkGray
+Write-Host "folders and the Recycle Bin. None of it can be undone - files in the Recycle Bin are gone." -ForegroundColor DarkGray
+if ((Read-Host "Run disk cleanup now? Type y (anything else skips)") -match '^(y|yes)$') {
+    $freeBefore = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'").FreeSpace
+    # 1) component store: drop superseded update payloads
+    Write-Host "==> DISM /StartComponentCleanup" -ForegroundColor Cyan
+    dism.exe /online /cleanup-image /startcomponentcleanup | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Host "    component cleanup exit $LASTEXITCODE (continuing)" -ForegroundColor DarkGray }
+    # 2) Windows Update download cache
+    Write-Host "==> Windows Update cache" -ForegroundColor Cyan
+    # Record what wuauserv looked like first and put it back that way. Starting it
+    # unconditionally would silently re-enable Windows Update on a machine where it had
+    # deliberately been stopped or disabled - the cleanup would be changing something the
+    # user never asked it to touch.
+    $wuWasRunning = $false
+    $wuStopped = $false
+    try {
+        $wuSvc = Get-Service wuauserv -ErrorAction Stop
+        $wuWasRunning = ([string]$wuSvc.Status -eq 'Running')
+        if ($wuWasRunning) {
+            Stop-Service wuauserv -Force -ErrorAction Stop
+            $wuStopped = $true
+        }
+        $wuCache = Join-Path $env:SystemRoot 'SoftwareDistribution\Download'
+        if (Test-Path $wuCache) { Get-ChildItem $wuCache -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue }
+    } catch {
+        Write-Host "    update-cache step skipped ($($_.Exception.Message))" -ForegroundColor DarkGray
+    } finally {
+        # Only restart it if this script is what stopped it.
+        if ($wuStopped) {
+            try { Start-Service wuauserv -ErrorAction Stop }
+            catch { Write-Host "    could not restart wuauserv - start it in services.msc" -ForegroundColor Yellow }
+        }
+    }
+    # 3) temp folders (anything a running process holds open is skipped)
+    Write-Host "==> temp folders" -ForegroundColor Cyan
+    foreach ($t in @($env:TEMP, (Join-Path $env:SystemRoot 'Temp'))) {
+        if ($t -and (Test-Path $t)) { Get-ChildItem $t -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    # 4) Recycle Bin
+    Write-Host "==> Recycle Bin" -ForegroundColor Cyan
+    Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+    $freeAfter = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'").FreeSpace
+    $freed = [math]::Round((($freeAfter - $freeBefore) / 1GB), 2)
+    if ($freed -gt 0) { Write-Host ("    freed about {0} GB on {1}" -f $freed, $env:SystemDrive) -ForegroundColor DarkGray }
+    else              { Write-Host  "    cleanup done" -ForegroundColor DarkGray }
+    Write-Event 'INFO' ("disk cleanup done (freed ~{0} GB)" -f $freed)
+} else {
+    Write-Host "    skipped disk cleanup" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'disk cleanup skipped by user'
 }
-# 4) Recycle Bin
-Write-Host "==> Recycle Bin" -ForegroundColor Cyan
-Clear-RecycleBin -Force -ErrorAction SilentlyContinue
-$freeAfter = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'").FreeSpace
-$freed = [math]::Round((($freeAfter - $freeBefore) / 1GB), 2)
-if ($freed -gt 0) { Write-Host ("    freed about {0} GB on {1}" -f $freed, $env:SystemDrive) -ForegroundColor DarkGray }
-else              { Write-Host  "    cleanup done" -ForegroundColor DarkGray }
-Write-Event 'INFO' ("disk cleanup done (freed ~{0} GB)" -f $freed)
 
 # External tweak tools
 Write-Host "`n=== External tweak tools (opt in) ===" -ForegroundColor Magenta

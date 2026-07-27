@@ -15,6 +15,19 @@
   file is downloaded from raw or read from a clone. If you replace
   sysmon\sysmonconfig-export.xml, refresh $configSha256 with Get-FileHash - and
   commit it so the LF blob that GitHub serves matches the pin.
+
+  KNOW WHAT THIS CONFIG DOES NOT COLLECT. The bundled copy is source version 74
+  (2021-07-08), schemaversion 4.50. Upstream ships three rule groups commented
+  out, and this copy keeps them that way:
+    - Event 23 FileDelete       - no record of files being wiped (ransomware)
+    - Event 24 ClipboardChange  - no clipboard capture
+    - Event 25 ProcessTampering - no record of code written into a live process
+  They are off upstream because FileDelete archives deleted files and can fill a
+  disk, and ProcessTampering needs tuning plus a SIEM to correlate ProcessGuids.
+  That is a defensible default, but it is a deliberate blind spot rather than
+  full coverage. To turn one on, uncomment its RuleGroup in the XML, refresh
+  $configSha256, and reload with: sysmon -c <config.xml>
+  The health check reports which event IDs the channel is actually receiving.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -37,21 +50,31 @@ $logMaxBytes  = 512MB
 
 try {
 
-# Keep a verified config copy for later reconfiguration.
+# Keep a verified config copy for later reconfiguration. Everything lands in a unique
+# staging file first: writing straight to $stagedConfig would destroy the previously
+# verified configuration before the new one has proved it matches the pin, and a failed
+# run would leave an unverified file at the exact path a later run trusts and reloads.
 Write-Host "==> Sysmon config" -ForegroundColor Cyan
-$null = New-Item (Split-Path $stagedConfig) -ItemType Directory -Force
-$localConfig = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'sysmonconfig-export.xml' } else { $null }
-if ($localConfig -and (Test-Path $localConfig)) {
-    Copy-Item $localConfig $stagedConfig -Force
-    Write-Host "    using repo copy: $localConfig" -ForegroundColor DarkGray
-} else {
-    Invoke-WebRequest $configUrl -OutFile $stagedConfig -UseBasicParsing -TimeoutSec 300
-    Write-Host "    downloaded from repo" -ForegroundColor DarkGray
+$configDir = Split-Path $stagedConfig
+$null = New-Item $configDir -ItemType Directory -Force
+$stagingConfig = Join-Path $configDir ("sysmonconfig.{0}.staging" -f [guid]::NewGuid().ToString('N'))
+try {
+    $localConfig = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'sysmonconfig-export.xml' } else { $null }
+    if ($localConfig -and (Test-Path $localConfig)) {
+        Copy-Item $localConfig $stagingConfig -Force
+        Write-Host "    using repo copy: $localConfig" -ForegroundColor DarkGray
+    } else {
+        Invoke-WebRequest $configUrl -OutFile $stagingConfig -UseBasicParsing -TimeoutSec 300
+        Write-Host "    downloaded from repo" -ForegroundColor DarkGray
+    }
+    if ((Get-FileHash $stagingConfig -Algorithm SHA256).Hash -ne $configSha256) {
+        throw 'config SHA256 mismatch - refresh $configSha256 if you replaced the config on purpose'
+    }
+    $null = [xml](Get-Content $stagingConfig -Raw)   # parse guard: fail here, not mid-install
+    Move-Item $stagingConfig $stagedConfig -Force
+} finally {
+    if (Test-Path $stagingConfig) { Remove-Item $stagingConfig -Force -ErrorAction SilentlyContinue }
 }
-if ((Get-FileHash $stagedConfig -Algorithm SHA256).Hash -ne $configSha256) {
-    throw 'config SHA256 mismatch - refresh $configSha256 if you replaced the config on purpose'
-}
-$null = [xml](Get-Content $stagedConfig -Raw)   # parse guard: fail here, not mid-install
 
 # Built-in and standalone Sysmon use different service names.
 $svc = Get-CimInstance Win32_Service -Filter "Name='Sysmon' OR Name='Sysmon64'" |
@@ -83,10 +106,14 @@ if ($null -ne $svc) {
     if (-not $sysmonExe) {
         # Older Windows use the Authenticode-verified Sysinternals package.
         Write-Host "==> downloading standalone Sysmon (no built-in support on this Windows)" -ForegroundColor Cyan
-        $zip = Join-Path $env:TEMP 'Sysmon.zip'
-        $dir = Join-Path $env:TEMP 'Sysmon-extracted'
+        # Unique paths, not a predictable %TEMP%\Sysmon.zip: this binary is about to be
+        # executed as administrator, so it must not land where an earlier run - or anything
+        # else that can write there - has already placed a file with that name.
+        $stagingId = [guid]::NewGuid().ToString('N')
+        $zip = Join-Path $env:TEMP "Sysmon.$stagingId.zip"
+        $dir = Join-Path $env:TEMP "Sysmon-extracted.$stagingId"
         Invoke-WebRequest 'https://download.sysinternals.com/files/Sysmon.zip' -OutFile $zip -UseBasicParsing -TimeoutSec 300
-        if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+        $null = New-Item $dir -ItemType Directory -Force
         Expand-Archive $zip -DestinationPath $dir -Force
         $exeName = switch ($env:PROCESSOR_ARCHITECTURE) {
             'ARM64' { 'Sysmon64a.exe' }
