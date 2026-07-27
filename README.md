@@ -56,6 +56,37 @@ Severity is deliberately conservative — `Critical` means data loss or an activ
 
 The evidence lines are what make a finding actionable, and they are also what makes a report identifying: computer and user names, profile paths, local addresses and the Wi-Fi network name, listening ports with the owning process, members of the local Administrators group, installed software. `-ReportPath` writes that to disk with a warning at the top of the file — read it through before pasting it into a forum thread or a support ticket.
 
+### What it does not do
+
+It checks **configuration and history**, not behaviour. It cannot tell you something malicious is running right now: there is no process baselining, no hash reputation lookup, no memory inspection and no traffic analysis. A machine can pass every check here and still be compromised — a clean report means "nothing is configured wrong and nothing bad is recorded", not "this machine is clean".
+
+Four things it deliberately leaves to tools built for them:
+
+| Not covered | Use instead | Can be delegated to |
+|---|---|---|
+| Compliance against a published baseline (CIS, Microsoft Security Baselines) | [HardeningKitty](https://github.com/scipag/HardeningKitty) | — |
+| Privilege-escalation paths — weak service ACLs, unquoted service paths, writable `%PATH%`, DLL hijack candidates | [PrivescCheck](https://github.com/itm4n/PrivescCheck) | `-PrivescCheckPath` |
+| Credential exposure — saved RDP passwords, browser credential stores, secrets in `unattend.xml` or shell history | [winPEAS](https://github.com/peass-ng/PEASS-ng) | — |
+| Threat hunting *inside* log content — suspicious command lines in 4688, obfuscated PowerShell in 4104 | [DeepBlueCLI](https://github.com/sans-blue-team/DeepBlueCLI) | `-DeepBlueCliPath` |
+
+This tool verifies that the logging those tools depend on exists and reaches far enough back. It does not read the contents looking for attacks.
+
+### Delegating to those tools
+
+Two of them can be folded in, if you already have them:
+
+```powershell
+.\health-check.ps1 -DeepBlueCliPath C:\tools\DeepBlueCLI\DeepBlue.ps1 `
+                   -PrivescCheckPath C:\tools\PrivescCheck\PrivescCheck.ps1
+```
+
+Their findings appear in the report under `Logging` and `Security` respectively, attributed to them. Read this before using it:
+
+- **Nothing is downloaded and neither tool is bundled.** You obtain and vet them yourself; the path you pass is the only way either runs. That is not only a supply-chain choice — DeepBlueCLI is GPL-3.0 and this project is MIT, so shipping its code here would force the whole repo to GPL. Running it as a separate program is what the GPL permits, and it leaves the credit for those detections where it belongs.
+- **This is where "changes nothing" stops being a promise about code you can read in one file.** Both tools are read-only by design, but you are the one choosing to trust them.
+- **PrivescCheck writes a CSV report.** It goes to a uniquely named temporary file and is deleted when the run ends. It is the only disk write anywhere in `health-check.ps1`, and the contract test pins it — along with the process launch — to the delegation code, so neither can appear anywhere else without failing CI.
+- **PrivescCheck gives more unelevated.** It deliberately skips many checks when run as administrator, to avoid reporting things only an administrator could exploit. Run the health check as an ordinary user to get its full output.
+
 ## Hardening pass
 
 [`hardening/harden-extras.ps1`](hardening/harden-extras.ps1) tightens the handful of settings that [Harden System Security](https://github.com/HotCakeX/Harden-Windows-Security) and ConfigureDefender leave alone. It runs standalone on any machine:
@@ -96,7 +127,7 @@ Re-running is fine: installed apps are skipped. It then asks (y/n) whether to ru
 - **AI:** Ollama (local LLM runtime), CUDA Toolkit (GPU compute — several GB, and only useful on an NVIDIA GPU)
 - **Sysadmin / net:** PowerToys, Sysinternals Suite, WinSCP, PuTTY, MobaXterm, Tailscale, WireGuard, Mullvad VPN
 - **Cybersec:** Wireshark, Nmap, Burp Suite Community, KeePassXC, ConfigureDefender (Defender settings GUI — installed & signature-verified only, never auto-configured)
-- **Sysmon:** system activity logging to the event log — built-in Sysmon on Windows 11 24H2+ (enables the optional feature if needed), signature-checked Sysinternals download on older Windows, configured with a pinned [SwiftOnSecurity config](sysmon/sysmonconfig-export.xml) and a 512 MB log
+- **Sysmon:** system activity logging to the event log — built-in Sysmon on Windows 11 24H2+ (enables the optional feature if needed), signature-checked Sysinternals download on older Windows, configured with a pinned [SwiftOnSecurity config](sysmon/sysmonconfig-export.xml) and a 1 GB log (measured at ~150 MB a day on an ordinary desktop, so roughly a week of history)
 - **Hardening pass (opt-in, y/n):** offered near the end of the run — see [Hardening pass](#hardening-pass) above for what it changes
 - **Browser:** Google Chrome, Tor Browser
 - **Cleanup / maintenance:** Malwarebytes, AdwCleaner, BleachBit, DriverStore Explorer
@@ -136,7 +167,9 @@ VS Build Tools, VirtualBox and the CUDA Toolkit are large; remove those lines if
 - **ConfigureDefender** is downloaded from AndyFul's repo, verified (pinned SHA-256 + signature), and given a Desktop shortcut — but never launched. Open it and pick a level (Default / High / Max) yourself; refresh `$cdSha256` for new builds.
 - **Re-runs are additive:** installs use `winget install --no-upgrade`, so a second run adds what is missing and never moves the version of something already installed. Upgrading is a separate, explicit step at the end of the run.
 - **Sysmon on its own** (existing machine, no full run): from an elevated shell, `irm https://github.com/26zl/personal-windows-setup/raw/main/sysmon/install-sysmon.ps1 | iex`. Re-running only reapplies the config; refresh `$configSha256` in `install-sysmon.ps1` if you replace the XML.
-- **What the Sysmon config does *not* collect:** the bundled copy is SwiftOnSecurity source version 74 (2021-07-08, schemaversion 4.50), and it keeps upstream's three commented-out rule groups off — event 23 `FileDelete`, 24 `ClipboardChange`, and 25 `ProcessTampering`. That is upstream's deliberate default (FileDelete archives deleted files and can fill a disk; ProcessTampering needs tuning and a SIEM), but it is a blind spot: files being wiped and code injected into a live process leave no trace. Uncomment the rule group in the XML, refresh `$configSha256`, and reload with `sysmon -c`. The health check reports which event IDs the channel is actually receiving, so a config that silently collects less than you think shows up as a finding.
+- **The Sysmon config is a fork, not a copy.** The base is [SwiftOnSecurity sysmon-config](https://github.com/SwiftOnSecurity/sysmon-config) v74 (2021, CC BY 4.0, unmaintained since). The full diff, so nobody has to hunt for it: `schemaversion` raised 4.50 → 4.81; six added rule groups in a marked block at the end of the file; 23 include-rule paths rewritten from absolute `C:\` to drive-relative. Everything else is upstream, untouched.
+- **What it collects that upstream does not:** **25 `ProcessTampering`** (process hollowing has no benign explanation, and the event is rare), **26 `FileDeleteDetected`** scoped to executables, scripts, `.evtx` and shadow copies, **7 `ImageLoad`** narrowed to DLLs loading out of user-writable directories, and a `RegistryEvent` watch on `SilentProcessExit`. It leaves **23 `FileDelete`** off — that one archives every deleted file to disk and fills a drive quietly — and **24 `ClipboardChange`** off, because it captures clipboard *content*, so passwords and one-time codes would land in an event log. Requires Sysmon 14 or later. Refresh `$configSha256` if you edit the XML.
+- **Why not [sysmon-modular](https://github.com/olafhartong/sysmon-modular):** measured, not assumed. It carries 246 `RegistryEvent` include rules against this config's 114, and skews to `begin with` and `contains` where this one uses `end with`. On a machine already dropping RegistryEvent under load — which is what Sysmon event 255 `QUEUE` means, and it is common — that is the wrong direction. sysmon-modular is the better base if you want to tune per module; it is not a drop-in fix for a config that is flooding. The health check reports which event IDs the channel is actually receiving, so either way a config collecting less than you think shows up as a finding.
 - **Hardening pass and health check** run standalone too — see their sections above; neither needs the installer. They are read-only in different senses: the health check never writes anything at all, while the hardening pass reports first and applies a change only after you answer `y` to that specific change.
 
 </details>

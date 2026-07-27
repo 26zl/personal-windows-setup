@@ -69,17 +69,51 @@ Describe 'Read-only guarantee' {
             'Write-Host', 'Write-Verbose', 'Write-Debug', 'Write-Output',
             'Add-Member', 'Add-Type', 'New-Object', 'New-TimeSpan', 'New-PSObject',
             'Out-String', 'Out-Null', 'Out-File', 'Start-Sleep', 'Set-StrictMode',
-            'Format-Table', 'Format-List', 'Format-Hex', 'Import-Module', 'Export-Csv'
+            'Format-Table', 'Format-List', 'Format-Hex', 'Import-Module', 'Export-Csv',
+            # Reads a file and returns objects. State-changing only by verb, not in fact.
+            'Import-Csv'
         ) + $ownFunctions
 
         $banned = '^(Set|Remove|New|Start|Stop|Restart|Clear|Disable|Enable|Add|Rename|Move|Copy|Write|Out|Export|Import|Invoke|Register|Unregister|Install|Uninstall|Update|Reset|Suspend|Resume|Push|Pop|Mount|Dismount|Initialize|Format|Repair|Optimize)-'
 
-        $violations = $script:Commands |
-        ForEach-Object { $_.GetCommandName() } |
-        Where-Object { $_ -and $_ -match $banned -and $allowed -notcontains $_ } |
-        Sort-Object -Unique
+        # Start-Process and Remove-Item exist for exactly one purpose: running a
+        # third-party audit tool the caller opted into by passing its path, and deleting
+        # the report file that tool writes. Both are confined to the delegation code, and
+        # this test pins them there - a Remove-Item that appears anywhere else is a real
+        # violation of the promise, so the exemption is granted by location, not by name.
+        $delegationOnly = @('Start-Process', 'Remove-Item')
+        $delegationFunctions = @('Invoke-ExternalAudit', 'Test-SecurityHealth', 'Test-LoggingHealth')
 
-        $violations | Should -BeNullOrEmpty
+        $violations = @()
+        foreach ($command in $script:Commands) {
+            $name = $command.GetCommandName()
+            if (-not $name -or $name -notmatch $banned -or $allowed -contains $name) { continue }
+
+            if ($delegationOnly -contains $name) {
+                # Which function encloses this call?
+                $enclosing = $script:Functions |
+                    Where-Object {
+                        $_.Extent.StartOffset -le $command.Extent.StartOffset -and
+                        $_.Extent.EndOffset -ge $command.Extent.EndOffset
+                    } |
+                    Sort-Object { $_.Extent.EndOffset - $_.Extent.StartOffset } |
+                    Select-Object -First 1
+                if ($enclosing -and $delegationFunctions -contains $enclosing.Name) { continue }
+                $violations += "$name outside the delegation code (line $($command.Extent.StartLineNumber))"
+                continue
+            }
+            $violations += $name
+        }
+
+        ($violations | Sort-Object -Unique) | Should -BeNullOrEmpty
+    }
+
+    It 'never downloads the third-party tools it can delegate to' {
+        # Delegation means running something the user already has and vetted. The moment
+        # this script fetches either tool itself, the supply-chain story it tells in
+        # SECURITY.md stops being true.
+        $script:Raw | Should -Not -Match '(?i)(DeepBlue|PrivescCheck)[^\r\n]*?(Invoke-WebRequest|Invoke-RestMethod|iwr|irm|DownloadFile|DownloadString|git\s+clone)'
+        $script:Raw | Should -Not -Match '(?i)(Invoke-WebRequest|Invoke-RestMethod|DownloadFile|DownloadString)[^\r\n]*?(DeepBlue|PrivescCheck|sans-blue-team|itm4n)'
     }
 
     It 'runs external tools in analysis mode only' {
@@ -199,6 +233,43 @@ Describe 'Format-Size' {
 
     It 'does not crash on zero' {
         { Format-Size -Bytes 0 } | Should -Not -Throw
+    }
+}
+
+Describe 'Regex patterns' {
+    # An invalid pattern does not fail quietly - it throws at the point of use. Inside a
+    # category function that error is caught and turned into a skipped check or swallowed
+    # by $ErrorActionPreference, so the check silently never runs while the report still
+    # prints a healthy line next to it. Compiling every pattern here is cheap and catches
+    # it at build time instead.
+    It 'compiles every literal regex used with -match, -notmatch or -replace' {
+        $operators = 'match', 'notmatch', 'imatch', 'inotmatch', 'cmatch', 'cnotmatch',
+                     'replace', 'ireplace', 'creplace', 'split', 'isplit', 'csplit'
+        $binaries = $script:Ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.BinaryExpressionAst] -and
+                ($operators -contains [string]$n.Operator)
+            }, $true)
+
+        $bad = @()
+        foreach ($binary in $binaries) {
+            $right = $binary.Right
+            $pattern = $null
+            if ($right -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                $pattern = $right.Value
+            }
+            elseif ($right -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+                # Interpolated: replace each $(...) or $var with a harmless placeholder so
+                # the surrounding literal - which is where escaping mistakes live - is still
+                # compiled. This is the shape that bites, because the interpolation hides it.
+                $pattern = [regex]::Replace($right.Value, '\$\([^)]*\)|\$\w+(\.\w+)*', 'X')
+            }
+            if ($null -eq $pattern) { continue }
+            try { $null = [regex]::new($pattern) }
+            catch { $bad += "line $($binary.Extent.StartLineNumber): $($_.Exception.Message)" }
+        }
+
+        ($bad | Sort-Object -Unique) | Should -BeNullOrEmpty
     }
 }
 

@@ -221,14 +221,17 @@ if ($nvidiaGpu.Count -gt 0) {
     Write-Event 'SKIP' 'Nvidia.CUDA skipped - no NVIDIA GPU present'
 }
 
-# MSYS2 installs to C:\msys64 via the Qt installer, which returns exit 1 when that directory
-# already exists. winget can't correlate the existing install to the package either, so a plain
-# Install-App retries (and "fails" with 0x8A150006) on every re-run. Treat a working bash.exe
-# there as already installed, the same way Tor Browser and Discord are handled below.
+# MSYS2 installs to <SystemDrive>\msys64 via the Qt installer, which returns exit 1 when that
+# directory already exists. winget can't correlate the existing install to the package either,
+# so a plain Install-App retries (and "fails" with 0x8A150006) on every re-run. Treat a working
+# bash.exe there as already installed, the same way Tor Browser and Discord are handled below.
+# The drive comes from $env:SystemDrive rather than a literal C: - the default is C:\msys64 on
+# almost every machine, but not on one where Windows lives elsewhere.
+$msys2Root = Join-Path "$env:SystemDrive\" 'msys64'
 Write-Host "==> MSYS2.MSYS2" -ForegroundColor Cyan
-if (Test-Path 'C:\msys64\usr\bin\bash.exe') {
-    Write-Host "    already installed (skipped; C:\msys64 present)" -ForegroundColor DarkGray
-    Write-Event 'SKIP' 'MSYS2.MSYS2 already installed (C:\msys64)'
+if (Test-Path (Join-Path $msys2Root 'usr\bin\bash.exe')) {
+    Write-Host "    already installed (skipped; $msys2Root present)" -ForegroundColor DarkGray
+    Write-Event 'SKIP' "MSYS2.MSYS2 already installed ($msys2Root)"
 } else {
     Install-App 'MSYS2.MSYS2'
 }

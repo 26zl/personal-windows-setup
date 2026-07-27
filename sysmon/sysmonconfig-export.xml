@@ -60,7 +60,7 @@
 
 -->
 
-<Sysmon schemaversion="4.50">
+<Sysmon schemaversion="4.81">
 	<!--SYSMON META CONFIG-->
 	<HashAlgorithms>md5,sha256,IMPHASH</HashAlgorithms> <!-- Both MD5 and SHA256 are the industry-standard algorithms. Remove IMPHASH if you do not use DLL import fingerprinting. -->
 	<CheckRevocation/> <!-- Check loaded drivers, log if their code-signing certificate has been revoked, in case malware stole one to sign a kernel driver -->
@@ -237,7 +237,7 @@
 		<!--DATA: UtcTime, ProcessGuid, ProcessId, Image, TargetFilename, CreationUtcTime, PreviousCreationUtcTime-->
 	<RuleGroup name="" groupRelation="or">
 		<FileCreateTime onmatch="include">
-			<Image name="T1099" condition="begin with">C:\Users</Image> <!--Look for timestomping in user area, usually nothing should be doing that here-->
+			<Image name="T1099" condition="begin with">\Users</Image> <!--Look for timestomping in user area, usually nothing should be doing that here-->
 			<TargetFilename name="T1099" condition="end with">.exe</TargetFilename> <!--Look for backdated executables anywhere-->
 			<Image name="T1099" condition="begin with">\Device\HarddiskVolumeShadowCopy</Image> <!--Nothing should be written here | Credit: @SBousseaden [ https://twitter.com/SBousseaden/status/1133030955407630336 ] -->
 		</FileCreateTime>
@@ -270,15 +270,15 @@
 	<RuleGroup name="" groupRelation="or">
 		<NetworkConnect onmatch="include">
 			<!--Suspicious sources for network-connecting binaries-->
-			<Image name="Usermode" condition="begin with">C:\Users</Image> <!--Tools downloaded by users can use other processes for networking, but this is a very valuable indicator.-->
-			<Image name="Caution" condition="begin with">C:\Recycle</Image> <!--Nothing should operate from the RecycleBin locations.-->
-			<Image condition="begin with">C:\ProgramData</Image> <!--Normally, network communications should be sourced from "Program Files" not from ProgramData, something to look at-->
-			<Image condition="begin with">C:\Windows\Temp</Image> <!--Suspicious anything would communicate from the system-level temp directory-->
+			<Image name="Usermode" condition="begin with">\Users</Image> <!--Tools downloaded by users can use other processes for networking, but this is a very valuable indicator.-->
+			<Image name="Caution" condition="begin with">\Recycle</Image> <!--Nothing should operate from the RecycleBin locations.-->
+			<Image condition="begin with">\ProgramData</Image> <!--Normally, network communications should be sourced from "Program Files" not from ProgramData, something to look at-->
+			<Image condition="begin with">\Windows\Temp</Image> <!--Suspicious anything would communicate from the system-level temp directory-->
 			<Image name="Caution" condition="begin with">\</Image> <!--Devices and VSC shouldn't be executing changes | Credit: @SBousseaden @ionstorm @neu5ron @PerchedSystems [ https://twitter.com/SwiftOnSecurity/status/1133167323991486464 ] -->
-			<Image name="Caution" condition="begin with">C:\perflogs</Image> <!-- Credit @blu3_team [ https://blu3-team.blogspot.com/2019/05/netconn-from-suspicious-directories.html ] -->
-			<Image name="Caution" condition="begin with">C:\intel</Image> <!-- Credit @blu3_team [ https://blu3-team.blogspot.com/2019/05/netconn-from-suspicious-directories.html ] -->
-			<Image name="Caution" condition="begin with">C:\Windows\fonts</Image> <!-- Credit @blu3_team [ https://blu3-team.blogspot.com/2019/05/netconn-from-suspicious-directories.html ] -->
-			<Image name="Caution" condition="begin with">C:\Windows\system32\config</Image> <!-- Credit @blu3_team [ https://blu3-team.blogspot.com/2019/05/netconn-from-suspicious-directories.html ] -->
+			<Image name="Caution" condition="begin with">\perflogs</Image> <!-- Credit @blu3_team [ https://blu3-team.blogspot.com/2019/05/netconn-from-suspicious-directories.html ] -->
+			<Image name="Caution" condition="begin with">\intel</Image> <!-- Credit @blu3_team [ https://blu3-team.blogspot.com/2019/05/netconn-from-suspicious-directories.html ] -->
+			<Image name="Caution" condition="begin with">\Windows\fonts</Image> <!-- Credit @blu3_team [ https://blu3-team.blogspot.com/2019/05/netconn-from-suspicious-directories.html ] -->
+			<Image name="Caution" condition="begin with">\Windows\system32\config</Image> <!-- Credit @blu3_team [ https://blu3-team.blogspot.com/2019/05/netconn-from-suspicious-directories.html ] -->
 			<!--Suspicious Windows tools-->
 			<Image condition="image">at.exe</Image> <!--Windows: Remote task scheduling, removed in Win10 | Credit @ion-storm -->
 			<Image condition="image">certutil.exe</Image> <!--Windows: Certificate tool can contact outbound | Credit @ion-storm @FVT [ https://twitter.com/FVT/status/834433734602530817 ] -->
@@ -391,7 +391,7 @@
 		<!--DATA: UtcTime, ProcessGuid, ProcessId, Image-->
 	<RuleGroup name="" groupRelation="or">
 		<ProcessTerminate onmatch="include">
-			<Image condition="begin with">C:\Users</Image> <!--Process terminations by user binaries-->
+			<Image condition="begin with">\Users</Image> <!--Process terminations by user binaries-->
 			<Image condition="begin with">\</Image> <!--Devices and VSC shouldn't be executing changes | Credit: @SBousseaden @ionstorm @neu5ron @PerchedSystems [ https://twitter.com/SwiftOnSecurity/status/1133167323991486464 ] -->
 		</ProcessTerminate>
 	</RuleGroup>
@@ -517,21 +517,21 @@
 			<TargetFilename condition="end with">proj</TargetFilename><!--Microsoft:MSBuild:Script: [ https://twitter.com/subTee/status/885919612969394177 ] -->
 			<TargetFilename condition="end with">.sln</TargetFilename><!--Microsoft:MSBuild:Script: [ https://twitter.com/subTee/status/885919612969394177 ] -->
 			<TargetFilename condition="end with">.xls</TargetFilename><!--Microsoft [ https://medium.com/@threathuntingteam/msxsl-exe-and-wmic-exe-a-way-to-proxy-code-execution-8d524f642b75 ] -->
-			<TargetFilename name="DefaultUserModified" condition="begin with">C:\Users\Default</TargetFilename> <!--Windows: Changes to default user profile-->
-			<TargetFilename condition="begin with">C:\Windows\system32\Drivers</TargetFilename> <!--Microsoft: Drivers dropped here-->
-			<TargetFilename condition="begin with">C:\Windows\SysWOW64\Drivers</TargetFilename> <!--Microsoft: Drivers dropped here-->
-			<TargetFilename name="T1037,T1484" condition="begin with">C:\Windows\system32\GroupPolicy\Machine\Scripts</TargetFilename> <!--Group policy [ More information: http://www.hexacorn.com/blog/2017/01/07/beyond-good-ol-run-key-part-52/ ] -->
-			<TargetFilename name="T1037,T1484" condition="begin with">C:\Windows\system32\GroupPolicy\User\Scripts</TargetFilename> <!--Group policy [ More information: http://www.hexacorn.com/blog/2017/01/07/beyond-good-ol-run-key-part-52/ ] -->
-			<TargetFilename condition="begin with">C:\Windows\system32\Wbem</TargetFilename> <!--Microsoft:WMI: [ More information: http://2014.hackitoergosum.org/slides/day1_WMI_Shell_Andrei_Dumitrescu.pdf ] -->
-			<TargetFilename condition="begin with">C:\Windows\SysWOW64\Wbem</TargetFilename> <!--Microsoft:WMI: [ More information: http://2014.hackitoergosum.org/slides/day1_WMI_Shell_Andrei_Dumitrescu.pdf ] -->
-			<TargetFilename condition="begin with">C:\Windows\system32\WindowsPowerShell</TargetFilename> <!--Microsoft:Powershell: Look for modifications for persistence [ https://www.malwarearchaeology.com/cheat-sheets ] -->
-			<TargetFilename condition="begin with">C:\Windows\SysWOW64\WindowsPowerShell</TargetFilename> <!--Microsoft:Powershell: Look for modifications for persistence [ https://www.malwarearchaeology.com/cheat-sheets ] -->
-			<TargetFilename name="T1053" condition="begin with">C:\Windows\Tasks\</TargetFilename> <!--Microsoft:ScheduledTasks [ https://attack.mitre.org/wiki/Technique/T1053 ] -->
-			<TargetFilename name="T1053" condition="begin with">C:\Windows\system32\Tasks</TargetFilename> <!--Microsoft:ScheduledTasks [ https://attack.mitre.org/wiki/Technique/T1053 ] -->
-			<TargetFilename name="T1053" condition="begin with">C:\Windows\SysWOW64\Tasks</TargetFilename> <!--Microsoft:ScheduledTasks [ https://attack.mitre.org/wiki/Technique/T1053 ] -->
+			<TargetFilename name="DefaultUserModified" condition="begin with">\Users\Default</TargetFilename> <!--Windows: Changes to default user profile-->
+			<TargetFilename condition="begin with">\Windows\system32\Drivers</TargetFilename> <!--Microsoft: Drivers dropped here-->
+			<TargetFilename condition="begin with">\Windows\SysWOW64\Drivers</TargetFilename> <!--Microsoft: Drivers dropped here-->
+			<TargetFilename name="T1037,T1484" condition="begin with">\Windows\system32\GroupPolicy\Machine\Scripts</TargetFilename> <!--Group policy [ More information: http://www.hexacorn.com/blog/2017/01/07/beyond-good-ol-run-key-part-52/ ] -->
+			<TargetFilename name="T1037,T1484" condition="begin with">\Windows\system32\GroupPolicy\User\Scripts</TargetFilename> <!--Group policy [ More information: http://www.hexacorn.com/blog/2017/01/07/beyond-good-ol-run-key-part-52/ ] -->
+			<TargetFilename condition="begin with">\Windows\system32\Wbem</TargetFilename> <!--Microsoft:WMI: [ More information: http://2014.hackitoergosum.org/slides/day1_WMI_Shell_Andrei_Dumitrescu.pdf ] -->
+			<TargetFilename condition="begin with">\Windows\SysWOW64\Wbem</TargetFilename> <!--Microsoft:WMI: [ More information: http://2014.hackitoergosum.org/slides/day1_WMI_Shell_Andrei_Dumitrescu.pdf ] -->
+			<TargetFilename condition="begin with">\Windows\system32\WindowsPowerShell</TargetFilename> <!--Microsoft:Powershell: Look for modifications for persistence [ https://www.malwarearchaeology.com/cheat-sheets ] -->
+			<TargetFilename condition="begin with">\Windows\SysWOW64\WindowsPowerShell</TargetFilename> <!--Microsoft:Powershell: Look for modifications for persistence [ https://www.malwarearchaeology.com/cheat-sheets ] -->
+			<TargetFilename name="T1053" condition="begin with">\Windows\Tasks\</TargetFilename> <!--Microsoft:ScheduledTasks [ https://attack.mitre.org/wiki/Technique/T1053 ] -->
+			<TargetFilename name="T1053" condition="begin with">\Windows\system32\Tasks</TargetFilename> <!--Microsoft:ScheduledTasks [ https://attack.mitre.org/wiki/Technique/T1053 ] -->
+			<TargetFilename name="T1053" condition="begin with">\Windows\SysWOW64\Tasks</TargetFilename> <!--Microsoft:ScheduledTasks [ https://attack.mitre.org/wiki/Technique/T1053 ] -->
 			<Image condition="begin with">\Device\HarddiskVolumeShadowCopy</Image> <!--Nothing should be executing from VSC | Credit: @SBousseaden [ https://twitter.com/SBousseaden/status/1133030955407630336 ] -->
 			<!--Windows application compatibility-->
-			<TargetFilename condition="begin with">C:\Windows\AppPatch\Custom</TargetFilename> <!--Windows: Application compatibility shims [ https://www.fireeye.com/blog/threat-research/2017/05/fin7-shim-databases-persistence.html ] -->
+			<TargetFilename condition="begin with">\Windows\AppPatch\Custom</TargetFilename> <!--Windows: Application compatibility shims [ https://www.fireeye.com/blog/threat-research/2017/05/fin7-shim-databases-persistence.html ] -->
 			<TargetFilename condition="contains">VirtualStore</TargetFilename> <!--Windows: UAC virtualization [ https://blogs.msdn.microsoft.com/oldnewthing/20150902-00/?p=91681 ] -->
 			<!--Exploitable file names-->
 			<TargetFilename condition="end with">.xls</TargetFilename> <!--Legacy Office files are often used for attacks-->
@@ -1185,7 +1185,7 @@
 	<!--
 	<RuleGroup name="" groupRelation="or">
 		<ProcessTampering onmatch="exclude">
-			<Image condition="begin with">C:\Program Files (x86)\Microsoft\Edge\Application\</Image>
+			<Image condition="contains">\Microsoft\Edge\Application\</Image>
 		</ProcessTampering>
 	</RuleGroup>
 	-->
@@ -1195,6 +1195,162 @@
 			and certain tasked could not be performed or a bug exists in the Sysmon service. You can report any bugs on the
 			Sysinternals forum or over Twitter (@markrussinovich)."-->
 		<!--Cannot be filtered.-->
+
+	<!--
+		=====================================================================
+		LOCAL ADDITION - not part of SwiftOnSecurity sysmon-config v74.
+		Added by 26zl/personal-windows-setup. The CC BY 4.0 licence this file
+		carries permits modification with attribution, and this block is marked
+		so it is never mistaken for upstream.
+
+		This file is a fork, not a verbatim copy. Besides the rule groups below,
+		two things were changed above this line: schemaversion was raised from
+		4.50 to 4.81 (FileDeleteDetected needs it), and 23 include-rule paths were
+		rewritten from absolute C:\ to drive-relative, because an include rule that
+		cannot match is a detection that silently is not there. The 153 absolute
+		paths remaining in exclude rules are upstream's and are left alone - an
+		exclude that fails to match costs noise, not coverage.
+
+		Upstream leaves events 23, 24 and 25 commented out. Two of those defaults
+		are worth keeping and one is not:
+
+		  - ClipboardChange (24) stays OFF. It captures clipboard CONTENT, which
+		    means passwords and one-time codes land in an event log that is far
+		    easier to read than the password manager they came from.
+		  - FileDelete (23) stays OFF. It ARCHIVES every deleted file to disk,
+		    which fills a drive quietly. FileDeleteDetected (26) below records the
+		    same deletions without keeping a copy.
+		  - ProcessTampering (25) is turned ON. Process hollowing and herpaderping
+		    have no benign explanation on a personal machine, and the event is rare
+		    enough to add no measurable volume.
+
+		FileDeleteDetected (26) is scoped with onmatch="include" rather than a
+		blanket exclude. A machine that logs every deletion produces tens of
+		thousands of events an hour from browser caches and build output, and this
+		configuration already drops RegistryEvent under load. The include list
+		targets what deletion actually matters for: executables and scripts being
+		removed to cover tracks, and shadow copies being destroyed before
+		ransomware encrypts.
+		=====================================================================
+	-->
+
+	<RuleGroup name="" groupRelation="or">
+		<ProcessTampering onmatch="exclude">
+			<!-- Edge and Chrome self-update by rewriting their own image. -->
+			<Image condition="contains">\Microsoft\Edge\Application\</Image>
+			<Image condition="contains">\Google\Chrome\Application\</Image>
+		</ProcessTampering>
+	</RuleGroup>
+
+	<!--
+		SilentProcessExit. Upstream watches Image File Execution Options, Winlogon,
+		AppInit_DLLs, the LSA packages and the Run keys - but not this one, and it is
+		the same class of thing: a MonitorProcess value here runs a program of your
+		choosing every time the named process exits, which is how a payload restarts
+		itself the moment it is killed. The health check reports what the key contains
+		at the moment it runs; this rule is what notices the key being written between
+		two of those runs. Almost nothing writes here legitimately, so it costs nothing.
+	-->
+	<RuleGroup name="" groupRelation="or">
+		<RegistryEvent onmatch="include">
+			<TargetObject condition="contains">\SilentProcessExit\</TargetObject>
+		</RegistryEvent>
+	</RuleGroup>
+
+	<!--
+		ImageLoad (7). Upstream ships this group as an empty include, which matches
+		nothing - so event 7 never fires and DLL side-loading is invisible. Leaving it
+		empty is a defensible default, because ImageLoad unfiltered is the single
+		highest-volume event Sysmon produces and will bury a machine.
+
+		The middle ground: load a DLL from a directory an ordinary user can write to.
+		Windows components load from System32; a system binary loading its dependency
+		out of AppData or Temp instead is the side-loading pattern itself, and it is
+		rare enough on a normal machine to cost nothing.
+	-->
+	<RuleGroup name="" groupRelation="or">
+		<ImageLoad onmatch="include">
+			<ImageLoaded condition="contains">\Users\</ImageLoaded>
+			<ImageLoaded condition="contains">\ProgramData\</ImageLoaded>
+			<ImageLoaded condition="contains">\Windows\Temp\</ImageLoaded>
+			<ImageLoaded condition="contains">\PerfLogs\</ImageLoaded>
+			<ImageLoaded condition="contains">\$Recycle.Bin\</ImageLoaded>
+		</ImageLoad>
+	</RuleGroup>
+
+	<RuleGroup name="" groupRelation="or">
+		<ImageLoad onmatch="exclude">
+			<!-- Everything that legitimately runs out of a user profile: package
+			     managers, editors, browsers and the runtimes they ship. Without these
+			     a development machine produces thousands of events an hour. -->
+			<!-- Anything that installs per-user by design. This list will never be
+			     complete - it is the software the author happened to have - so treat a
+			     burst of event 7 after deployment as a signal to add what you run, not
+			     as a detection. -->
+			<ImageLoaded condition="contains">\AppData\Local\Programs\</ImageLoaded>
+			<ImageLoaded condition="contains">\AppData\Local\Microsoft\</ImageLoaded>
+			<ImageLoaded condition="contains">\AppData\Local\Google\</ImageLoaded>
+			<ImageLoaded condition="contains">\AppData\Local\Discord\</ImageLoaded>
+			<ImageLoaded condition="contains">\AppData\Local\Slack\</ImageLoaded>
+			<ImageLoaded condition="contains">\AppData\Local\SquirrelTemp\</ImageLoaded>
+			<ImageLoaded condition="contains">\AppData\Roaming\Spotify\</ImageLoaded>
+			<ImageLoaded condition="contains">\AppData\Roaming\Zoom\</ImageLoaded>
+			<ImageLoaded condition="contains">\AppData\Roaming\npm\</ImageLoaded>
+			<ImageLoaded condition="contains">\AppData\Local\JetBrains\</ImageLoaded>
+			<ImageLoaded condition="contains">\AppData\Local\Anaconda</ImageLoaded>
+			<ImageLoaded condition="contains">\AppData\Local\miniconda</ImageLoaded>
+			<ImageLoaded condition="contains">\AppData\Local\Steam\</ImageLoaded>
+			<ImageLoaded condition="contains">\Steam\steamapps\</ImageLoaded>
+			<ImageLoaded condition="contains">\Epic Games\</ImageLoaded>
+			<ImageLoaded condition="contains">\.cargo\</ImageLoaded>
+			<ImageLoaded condition="contains">\.rustup\</ImageLoaded>
+			<ImageLoaded condition="contains">\.dotnet\</ImageLoaded>
+			<ImageLoaded condition="contains">\.vscode\extensions\</ImageLoaded>
+			<ImageLoaded condition="contains">\node_modules\</ImageLoaded>
+			<ImageLoaded condition="contains">\scoop\</ImageLoaded>
+			<ImageLoaded condition="contains">\ProgramData\chocolatey\</ImageLoaded>
+			<ImageLoaded condition="contains">\ProgramData\Microsoft\</ImageLoaded>
+			<ImageLoaded condition="contains">\ProgramData\Package Cache\</ImageLoaded>
+			<ImageLoaded condition="contains">\WinGet\Packages\</ImageLoaded>
+		</ImageLoad>
+	</RuleGroup>
+
+	<RuleGroup name="" groupRelation="or">
+		<FileDeleteDetected onmatch="include">
+			<!-- Executables and scripts being deleted: the tail end of an intrusion. -->
+			<TargetFilename condition="end with">.exe</TargetFilename>
+			<TargetFilename condition="end with">.dll</TargetFilename>
+			<TargetFilename condition="end with">.sys</TargetFilename>
+			<TargetFilename condition="end with">.ps1</TargetFilename>
+			<TargetFilename condition="end with">.bat</TargetFilename>
+			<TargetFilename condition="end with">.cmd</TargetFilename>
+			<TargetFilename condition="end with">.vbs</TargetFilename>
+			<TargetFilename condition="end with">.js</TargetFilename>
+			<TargetFilename condition="end with">.scr</TargetFilename>
+			<!-- Shadow copies destroyed: the step before ransomware encrypts. -->
+			<TargetFilename condition="contains">\System Volume Information\</TargetFilename>
+			<!-- Event log files removed outright rather than cleared. -->
+			<TargetFilename condition="end with">.evtx</TargetFilename>
+		</FileDeleteDetected>
+	</RuleGroup>
+
+	<RuleGroup name="" groupRelation="or">
+		<FileDeleteDetected onmatch="exclude">
+			<!-- Windows writes and deletes one of these every time PowerShell evaluates
+			     a script execution policy. Measured at 4.5 per minute on an ordinary
+			     desktop - roughly 45,000 a week of pure noise, in a channel that has a
+			     size cap. It is Windows checking itself, never a deletion worth seeing. -->
+			<TargetFilename condition="contains">__PSScriptPolicyTest_</TargetFilename>
+			<!-- Installer and update scratch: MSI, Windows Update and the .NET native
+			     image generator all write scripts and DLLs into temp and remove them
+			     again as a normal part of finishing. -->
+			<TargetFilename condition="contains">\Windows\Temp\wct</TargetFilename>
+			<TargetFilename condition="contains">\Windows\SoftwareDistribution\</TargetFilename>
+			<TargetFilename condition="contains">\Windows\assembly\NativeImages_</TargetFilename>
+			<!-- Sysmon's own archive directory, if FileDelete is ever turned on too. -->
+			<TargetFilename condition="contains">\Sysmon\</TargetFilename>
+		</FileDeleteDetected>
+	</RuleGroup>
 
 	</EventFiltering>
 </Sysmon>

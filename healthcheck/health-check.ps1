@@ -17,9 +17,22 @@
   Severity means: Critical = acting now avoids data loss or an active compromise.
   High = a real hole or a fault you will notice. Medium = fix when convenient.
   Low = hygiene. Info = worth knowing, no action implied.
+
+  OPTIONAL, OFF BY DEFAULT: -DeepBlueCliPath and -PrivescCheckPath delegate to two
+  third-party audit tools, if you already have them. Nothing is downloaded and neither
+  tool ships with this script. Passing a path is the point where "this changes nothing"
+  stops being a promise about code you can read here and becomes a promise about
+  someone else's - both are read-only by design, but you are the one choosing to trust
+  them. PrivescCheck also writes a CSV report; it goes to a uniquely named temporary
+  file and is deleted again when the run ends. That is the only disk write in this file.
 #>
 
 [CmdletBinding()]
+# PSScriptAnalyzer cannot follow a script-scope parameter into a function defined later
+# in the same file, so it reports these two as unused. They are read in
+# Test-LoggingHealth and Test-SecurityHealth respectively.
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'DeepBlueCliPath')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'PrivescCheckPath')]
 param(
     # Which groups to run. 'All' is everything.
     [ValidateSet('All', 'System', 'Stability', 'Drivers', 'Storage', 'Performance',
@@ -34,7 +47,22 @@ param(
 
     # Skip the handful of checks that take several seconds each (SMART counters,
     # component store analysis, folder sizing).
-    [switch]$Fast
+    [switch]$Fast,
+
+    # Path to a copy of DeepBlueCLI's DeepBlue.ps1 that you obtained and vetted yourself.
+    # When given, it is run against the Security, System and PowerShell logs and its
+    # findings are folded into the Logging category. Nothing is downloaded, and nothing
+    # from DeepBlueCLI ships with this script - it is GPL-3.0 and this project is MIT,
+    # so it is invoked as a separate program, which GPL explicitly permits.
+    #   https://github.com/sans-blue-team/DeepBlueCLI
+    [string]$DeepBlueCliPath,
+
+    # Path to a copy of PrivescCheck.ps1 that you obtained and vetted yourself. When
+    # given, it is run in -Audit mode and its findings are folded into the Security
+    # category. Note that PrivescCheck deliberately skips many of its checks when run
+    # elevated, so it gives more when this script is run as an ordinary user.
+    #   https://github.com/itm4n/PrivescCheck
+    [string]$PrivescCheckPath
 )
 
 $ErrorActionPreference = 'Continue'
@@ -122,6 +150,69 @@ function Get-ServiceState {
     # Service state without the noise when the service does not exist on this SKU.
     param([Parameter(Mandatory)][string]$Name)
     try { return Get-Service -Name $Name -ErrorAction Stop } catch { return $null }
+}
+
+function Invoke-ExternalAudit {
+    <#
+      Runs a third-party read-only audit script the user pointed at, in a child
+      PowerShell process, and hands back its output as lines.
+
+      A child process rather than dot-sourcing, for three reasons: the other script's
+      $ErrorActionPreference, its functions and any name collisions cannot reach into
+      this run; a terminating error over there cannot take this run down; and its
+      output cannot end up in one of our return values by accident. The cost is a few
+      seconds of startup, which is acceptable for something that is opt-in anyway.
+
+      This is the one place where the "changes nothing" promise stops being ours.
+      Everything else here is a read the reader can verify in this file; this runs a
+      program written by someone else. Both supported tools are read-only by design,
+      but the caller is the one who decided to trust them, which is why nothing runs
+      unless a path is passed explicitly and nothing is ever downloaded.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [Parameter(Mandatory)][string]$Expression,
+        [int]$TimeoutSeconds = 300
+    )
+
+    if (-not (Test-Path -LiteralPath $ScriptPath)) {
+        return [PSCustomObject]@{ Ok = $false; Reason = "the file does not exist: $ScriptPath"; Lines = @() }
+    }
+
+    # Windows PowerShell, not pwsh: both tools target 5.1 and neither is verified on 7.
+    $hostExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $hostExe)) {
+        return [PSCustomObject]@{ Ok = $false; Reason = 'Windows PowerShell was not found to run it in'; Lines = @() }
+    }
+
+    $stdOut = Join-Path ([IO.Path]::GetTempPath()) ("healthcheck-ext-{0}.out" -f [guid]::NewGuid().ToString('N'))
+    $stdErr = [IO.Path]::ChangeExtension($stdOut, '.err')
+    try {
+        $arguments = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', $Expression)
+        $process = Start-Process -FilePath $hostExe -ArgumentList $arguments -NoNewWindow -PassThru `
+            -RedirectStandardOutput $stdOut -RedirectStandardError $stdErr -ErrorAction Stop
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try { $process.Kill() } catch { Write-Verbose -Message 'The external audit process had already exited.' }
+            return [PSCustomObject]@{ Ok = $false; Reason = "it did not finish within $TimeoutSeconds seconds and was stopped"; Lines = @() }
+        }
+        $lines = @()
+        if (Test-Path -LiteralPath $stdOut) { $lines = @(Get-Content -LiteralPath $stdOut -ErrorAction SilentlyContinue) }
+        $errorText = ''
+        if (Test-Path -LiteralPath $stdErr) { $errorText = (Get-Content -LiteralPath $stdErr -Raw -ErrorAction SilentlyContinue) }
+        if ($process.ExitCode -ne 0 -and @($lines).Count -eq 0) {
+            $firstError = (($errorText -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 1)
+            return [PSCustomObject]@{ Ok = $false; Reason = "it exited with code $($process.ExitCode). $firstError"; Lines = @() }
+        }
+        return [PSCustomObject]@{ Ok = $true; Reason = ''; Lines = @($lines | Where-Object { $_ -and $_.Trim() }) }
+    }
+    catch {
+        return [PSCustomObject]@{ Ok = $false; Reason = $_.Exception.Message; Lines = @() }
+    }
+    finally {
+        foreach ($temp in @($stdOut, $stdErr)) {
+            if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
+        }
+    }
 }
 
 function Format-Size {
@@ -2713,6 +2804,126 @@ function Test-StorageHealth {
             }
         }
     }
+
+    # NTFS dirty bit. When a volume is marked dirty, Windows has already decided the file
+    # system needs repair and has queued chkdsk for the next boot. Nothing in the interface
+    # says so, and the machine keeps running on the volume in the meantime.
+    if (Get-Command -Name fsutil -CommandType Application -ErrorAction SilentlyContinue) {
+        $dirtyVolumes = @()
+        $dirtyAssessed = @()
+        $dirtyUnreadable = @()
+
+        # BootExecute needs no elevation and covers every volume at once: Windows writes
+        # "autocheck autochk /r \??\C:" here when a repair is queued, against the normal
+        # "autocheck autochk *". Checking it first means an unelevated run still catches
+        # the case that matters most.
+        $bootExecuteText = ''
+        $bootExecute = Get-RegValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'BootExecute'
+        if ($bootExecute) { $bootExecuteText = (@($bootExecute) -join ' ') }
+        # IndexOf, not a regex assembled from the drive letter - no pattern is built from
+        # data anywhere in this block.
+        $autochkHasSwitch = ($bootExecuteText.IndexOf('autochk /', [StringComparison]::OrdinalIgnoreCase) -ge 0)
+
+        foreach ($volumeLetter in @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DeviceID)) {
+            if ($autochkHasSwitch -and $bootExecuteText.IndexOf($volumeLetter, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $dirtyAssessed += $volumeLetter
+                $dirtyVolumes += "$volumeLetter (BootExecute is '$bootExecuteText' - a repair pass is queued for the next boot)"
+                continue
+            }
+
+            # fsutil is the second opinion and it needs administrator - but only for the
+            # system volume. A data volume answers to an ordinary user, which is exactly
+            # how the previous version went wrong: D: answering "not dirty" set a single
+            # "checked" flag, and the check then reported "no fixed volume is marked dirty"
+            # while C: had been skipped without a word. Coverage is now tracked per volume.
+            $dirtyRaw = & fsutil dirty query $volumeLetter 2>&1 | Out-String
+            $fsutilExit = $LASTEXITCODE
+            # Both answers name the volume; "Error 5: Access is denied." does not. Requiring
+            # the volume name stops an error message being read as a clean bill of health.
+            $answersAboutVolume = ($dirtyRaw.IndexOf($volumeLetter, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+            if ($fsutilExit -ne 0 -or -not $answersAboutVolume) {
+                $dirtyUnreadable += $volumeLetter
+                continue
+            }
+            $dirtyAssessed += $volumeLetter
+            # Only the clean answer carries a negation, in every language.
+            if ($dirtyRaw -notmatch '(?i)\bnot\b') {
+                $dirtyVolumes += "$volumeLetter (fsutil reports the volume dirty)"
+            }
+        }
+
+        if ($dirtyVolumes.Count -gt 0) {
+            Add-Finding -Severity 'High' -Title 'A volume is marked dirty and has a repair pass queued' `
+                -Evidence ($dirtyVolumes -join '; ') `
+                -Impact 'Windows has found a file system inconsistency and scheduled chkdsk for the next restart. Until that runs the volume keeps being written to in the state that caused it, and the usual cause is either a failing drive or a hard power loss.' `
+                -Fix 'Back up first, then restart so the queued check can run. Inspect the result afterwards in Event Viewer > Windows Logs > Application, source Chkdsk / Wininit. If it comes back repeatedly, treat the drive as suspect.' `
+                -Confidence 'Likely'
+        } elseif ($dirtyAssessed.Count -eq 0) {
+            Add-Skip -Message ("The NTFS dirty bit was not checked on any volume - fsutil needs administrator rights for the system volume, and BootExecute shows no queued repair. Not read: {0}." -f (($dirtyUnreadable -join ', ')))
+        } elseif ($dirtyUnreadable.Count -gt 0) {
+            Add-Skip -Message ("No queued repair on {0}, but {1} could not be read without administrator rights - so the dirty bit is only partly assessed." -f (($dirtyAssessed -join ', ')), (($dirtyUnreadable -join ', ')))
+        } else {
+            Add-Ok -Message ("No repair is queued and none of the fixed volumes is marked dirty ({0})." -f (($dirtyAssessed -join ', ')))
+        }
+    }
+
+    # Windows Recovery Environment. It is what Reset this PC, Startup Repair and the
+    # BitLocker recovery flow all boot into. A machine whose WinRE is missing or disabled
+    # has no recovery path short of external media - and nothing warns about it.
+    if (Get-Command -Name reagentc -CommandType Application -ErrorAction SilentlyContinue) {
+        try {
+            $reagentRaw = & reagentc /info 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) {
+                Add-Skip -Message 'Windows Recovery Environment status was not read - reagentc requires administrator rights.'
+            } else {
+                # The status word is translated; the WinRE location line is a path and is not.
+                # An enabled WinRE always has a location, a disabled one has an empty one.
+                $winreLocated = ($reagentRaw -match '(?im)^\s*[^:\r\n]*:\s*\\\\\?\\GLOBALROOT\S+')
+                if ($winreLocated) {
+                    Add-Ok -Message 'The Windows Recovery Environment is present and enabled, so Startup Repair and Reset this PC can run.'
+                } else {
+                    Add-Finding -Severity 'Medium' -Title 'The Windows Recovery Environment is not available' `
+                        -Evidence 'reagentc /info reports no WinRE location, which means it is disabled or its image is missing.' `
+                        -Impact 'Startup Repair, Reset this PC, System Restore from boot and the BitLocker recovery screen all live in WinRE. Without it, a machine that will not boot can only be recovered from external installation media.' `
+                        -Fix 'Check with: reagentc /info. Turn it back on as administrator with: reagentc /enable. If that fails the winre.wim image is missing and has to be restored from installation media.' `
+                        -Confidence 'Likely'
+                }
+            }
+        } catch {
+            Add-Skip -Message 'Windows Recovery Environment status could not be read.'
+        }
+    }
+
+    # Raw SMART attributes. Get-StorageReliabilityCounter is empty on a great many consumer
+    # SATA drives, which leaves the wear and reallocated-sector figures unread. The
+    # MSStorageDriver classes expose the raw attribute table where the driver supports it,
+    # and simply are not there where it does not - so this degrades to a skip rather than
+    # a wrong answer.
+    if ($Fast) {
+        Add-Skip -Message 'Raw SMART attributes: skipped because -Fast is set.'
+    } elseif (-not $ctx.IsAdmin) {
+        Add-Skip -Message 'Raw SMART attributes were not read - the MSStorageDriver WMI classes require administrator rights.'
+    } else {
+        try {
+            $smartStatus = @(Get-CimInstance -Namespace 'root\wmi' -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction Stop)
+            if ($smartStatus.Count -eq 0) {
+                Add-Skip -Message 'Raw SMART attributes: no drive on this machine exposes the MSStorageDriver failure-prediction interface (normal for NVMe and for many USB bridges).'
+            } else {
+                $predicted = @($smartStatus | Where-Object { $_.PredictFailure })
+                if ($predicted.Count -gt 0) {
+                    Add-Finding -Severity 'Critical' -Title 'A drive is predicting its own failure' `
+                        -Evidence (@($predicted | ForEach-Object { "$($_.InstanceName) reports PredictFailure = True, reason code $($_.Reason)" }) -join '; ') `
+                        -Impact 'The drive firmware itself says it expects to fail. This is the strongest warning a disk gives, and it usually arrives days to weeks before the failure.' `
+                        -Fix 'Back up now, before anything else. Then replace the drive. Confirm with the vendor tool or: Get-PhysicalDisk | Select-Object FriendlyName,HealthStatus,OperationalStatus' `
+                        -Confidence 'Certain'
+                } else {
+                    Add-Ok -Message ("None of the {0} drive(s) exposing SMART failure prediction is predicting a failure." -f $smartStatus.Count)
+                }
+            }
+        } catch {
+            Add-Skip -Message 'Raw SMART attributes: the MSStorageDriver WMI classes are not available on this machine.'
+        }
+    }
 }
 
 # Category "Performance", ordered by how much each finding actually costs the user:
@@ -3541,7 +3752,7 @@ function Test-PerformanceHealth {
         $serviceNames = @($nonWindowsServices | ForEach-Object { $_.Name })
         $serviceShown = $serviceNames
         if ($serviceNames.Count -gt 10) { $serviceShown = @($serviceNames | Select-Object -First 10) }
-        $serviceEvidence = '{0} of {1} services with start type Automatic have their executable outside C:\Windows: {2}' -f $nonWindowsServices.Count, $autoServices.Count, ($serviceShown -join ', ')
+        $serviceEvidence = '{0} of {1} services with start type Automatic have their executable outside {2}: {3}' -f $nonWindowsServices.Count, $autoServices.Count, $env:SystemRoot, ($serviceShown -join ', ')
         if ($serviceNames.Count -gt 10) { $serviceEvidence = $serviceEvidence + (' (+{0} more)' -f ($serviceNames.Count - 10)) }
 
         if ($nonWindowsServices.Count -gt 25) {
@@ -4065,6 +4276,98 @@ function Test-PowerHealth {
     } catch {
         # Win32_Processor is rarely missing, but some VMs answer with empty fields
         Add-Skip -Message 'The processor clock speed could not be read from Win32_Processor.'
+    }
+
+    # Sustained throttling, as Windows itself measured it. The clock-speed snapshot above
+    # is one instant; Kernel-Processor-Power event 37 is the kernel saying the processor
+    # was held below its nominal speed by something other than the OS - firmware, thermals
+    # or a power limit. On a machine whose ACPI thermal zones report placeholder values,
+    # this is the only trustworthy throttling signal available.
+    if ($Fast) {
+        Add-Skip -Message 'Throttling history: skipped because -Fast is set.'
+    } else {
+        $throttleEvents = @()
+        try {
+            $throttleEvents = @(Get-WinEvent -FilterHashtable @{
+                    LogName      = 'System'
+                    ProviderName = 'Microsoft-Windows-Kernel-Processor-Power'
+                    Id           = 37
+                    StartTime    = (Get-Date).AddDays(-30)
+                } -MaxEvents 200 -ErrorAction Stop)
+        } catch {
+            # No event 37 in the window is the normal, healthy case, and Get-WinEvent
+            # throws rather than returning nothing.
+            Write-Verbose -Message ("No Kernel-Processor-Power event 37 in the window: {0}" -f $_.Exception.Message)
+        }
+        if ($throttleEvents.Count -eq 0) {
+            Add-Ok -Message 'No firmware or thermal throttling recorded by the kernel in the last 30 days (event 37).'
+        } else {
+            $throttleSeverity = if ($throttleEvents.Count -ge 50) { 'Medium' } else { 'Low' }
+            Add-Finding -Severity $throttleSeverity -Title 'The processor has been throttled below its nominal speed' `
+                -Evidence ("{0} Kernel-Processor-Power event(s) with ID 37 in the last 30 days. Most recent: {1}" -f $throttleEvents.Count, (($throttleEvents | Select-Object -First 3 | ForEach-Object { $_.TimeCreated }) -join ', ')) `
+                -Impact 'Windows recorded that the processor was held below its nominal frequency by something outside the operating system: temperature, a firmware power limit, or an undersized power supply. It shows up as the machine feeling fast at first and then slowing under sustained load.' `
+                -Fix 'Check cooling first - dust in the heatsink and dried-out thermal paste are the usual causes. Then look at the UEFI power and thermal limits (PPT, TDC, EDC on AMD; PL1/PL2 on Intel), and confirm the power plan is not the cause with: powercfg /qh SCHEME_CURRENT SUB_PROCESSOR' `
+                -Confidence 'Likely'
+        }
+    }
+
+    # Physical memory: the modules themselves, and whether the built-in diagnostic has
+    # ever been run and what it said. Nothing else in the script looks at RAM hardware,
+    # and a failing module presents as random crashes that look like software faults.
+    try {
+        $memoryModules = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop)
+        if ($memoryModules.Count -gt 0) {
+            $moduleText = (@($memoryModules | ForEach-Object {
+                        $sizeGb = [math]::Round(([double]$_.Capacity) / 1GB, 0)
+                        $speed = if ($_.ConfiguredClockSpeed) { $_.ConfiguredClockSpeed } else { $_.Speed }
+                        "$($_.DeviceLocator) $sizeGb GB @ $speed MT/s $($_.Manufacturer)".Trim()
+                    }) -join '; ')
+            $mixedSpeeds = @($memoryModules | ForEach-Object { $_.Speed } | Sort-Object -Unique)
+            if ($mixedSpeeds.Count -gt 1) {
+                Add-Finding -Severity 'Low' -Title 'The memory modules are not all the same speed' `
+                    -Evidence $moduleText `
+                    -Impact 'Mixed modules run at the speed of the slowest one, and mismatched kits are a common cause of instability that looks like random application crashes.' `
+                    -Fix 'Use a matched kit if you can. If the machine is unstable, test with one module at a time.' `
+                    -Confidence 'Likely'
+            } else {
+                Add-Finding -Severity 'Info' -Title 'Installed memory modules' `
+                    -Evidence $moduleText `
+                    -Impact 'Useful when diagnosing instability, and for knowing which slots are occupied before an upgrade.' `
+                    -Confidence 'Certain'
+            }
+        }
+    } catch {
+        Add-Skip -Message 'Win32_PhysicalMemory could not be read, so the memory modules were not inventoried.'
+    }
+
+    if (-not $Fast) {
+        $memDiag = @()
+        try {
+            $memDiag = @(Get-WinEvent -FilterHashtable @{
+                    LogName = 'System'
+                    ProviderName = 'Microsoft-Windows-MemoryDiagnostics-Results'
+                    Id = 1101, 1201
+                } -MaxEvents 5 -ErrorAction Stop)
+        } catch {
+            Write-Verbose -Message ("No memory diagnostic results found: {0}" -f $_.Exception.Message)
+        }
+        if ($memDiag.Count -eq 0) {
+            Add-Skip -Message 'The Windows memory diagnostic has never been run on this machine, so there is no RAM test result to report. Run mdsched.exe if the machine is unstable.'
+        } else {
+            $latest = $memDiag[0]
+            $resultText = (([string]$latest.Message) -replace '\s+', ' ').Trim()
+            if ($resultText.Length -gt 200) { $resultText = $resultText.Substring(0, 200) }
+            # Event 1201 is the detailed result; hardware problems are reported there.
+            if ([int]$latest.Id -eq 1201 -or $resultText -match '(?i)error|problem|fail') {
+                Add-Finding -Severity 'High' -Title 'The Windows memory diagnostic reported a problem' `
+                    -Evidence ("Event {0} on {1}: {2}" -f $latest.Id, $latest.TimeCreated, $resultText) `
+                    -Impact 'A memory module that fails a test causes crashes, file corruption and blue screens that look like unrelated software faults.' `
+                    -Fix 'Test one module at a time to find the faulty one, and replace it. MemTest86 from a USB stick tests more thoroughly than the built-in tool.' `
+                    -Confidence 'Likely'
+            } else {
+                Add-Ok -Message ("The Windows memory diagnostic last ran {0} and found no errors." -f $latest.TimeCreated)
+            }
+        }
     }
 }
 
@@ -4845,6 +5148,175 @@ function Test-NetworkHealth {
             -Confidence 'Certain'
     } else {
         Add-Ok -Message 'No third-party network filters are bound to the network adapters.'
+    }
+
+    # Outbound BLOCK rules aimed at Windows' own binaries. Tweak and "telemetry blocker"
+    # scripts add these freely, and the result is a machine that silently cannot update or
+    # cannot reach Defender's cloud - with nothing in the interface saying so.
+    try {
+        $systemBinaryPattern = '(?i)\\(wuauclt|usoclient|MoUsoCoreWorker|MpCmdRun|MsMpEng|SecurityHealthService|svchost|smartscreen|wermgr|CompatTelRunner|DeviceCensus|sihclient)\.exe$'
+        $outboundBlocks = @()
+        # Get-NetFirewallRule throws "No matching MSFT_NetFirewallRule objects found" when
+        # the filter matches nothing, rather than returning an empty set. A machine with no
+        # outbound block rules at all is the healthy case, so it must not surface as an error.
+        $blockRules = @(Get-NetFirewallRule -Direction Outbound -Action Block -Enabled True -ErrorAction SilentlyContinue)
+        if ($blockRules.Count -gt 0) {
+            $appFilters = @(Get-NetFirewallApplicationFilter -ErrorAction Stop)
+            $filterByRule = @{}
+            foreach ($filter in $appFilters) {
+                if ($filter.Program -and $filter.Program -ne 'Any') { $filterByRule[[string]$filter.InstanceID] = [string]$filter.Program }
+            }
+            foreach ($rule in $blockRules) {
+                $program = $filterByRule[[string]$rule.InstanceID]
+                if ($program -and $program -match $systemBinaryPattern) {
+                    $outboundBlocks += "$($rule.DisplayName) -> $program"
+                }
+            }
+        }
+        if ($outboundBlocks.Count -gt 0) {
+            Add-Finding -Severity 'High' -Title 'Outbound firewall rules block Windows own update or security binaries' `
+                -Evidence (($outboundBlocks | Select-Object -First 6) -join '; ') `
+                -Impact 'These rules stop Windows Update or Defender from reaching Microsoft. The machine keeps reporting itself as configured for automatic updates while no update or signature ever arrives, and nothing in Settings indicates why. This is the single most damaging thing the popular telemetry-blocking scripts do.' `
+                -Fix 'wf.msc > Outbound Rules, sort by Action, and delete or disable the Block rules pointing at these programs. Then run Windows Update and check that it completes.' `
+                -Confidence 'Certain'
+        } else {
+            Add-Ok -Message 'No outbound firewall rule blocks Windows update or security binaries.'
+        }
+    } catch {
+        Add-Skip -Message ("Outbound firewall rules could not be examined: {0}" -f $_.Exception.Message)
+    }
+
+    # DNS over every address family. The IPv4-only view misses a machine whose IPv6
+    # resolver points somewhere else entirely, and NRPT rules override both.
+    try {
+        # fec0:0:0:ffff::1 through ::3 are the site-local addresses Windows ships on every
+        # interface as a fallback. They are not a configured resolver, and reporting them
+        # would fire this finding on every machine in existence.
+        $windowsDefaultV6Dns = @('fec0:0:0:ffff::1', 'fec0:0:0:ffff::2', 'fec0:0:0:ffff::3')
+        $v6Servers = @(Get-DnsClientServerAddress -AddressFamily IPv6 -ErrorAction Stop |
+                Where-Object { $_.InterfaceAlias -notmatch '(?i)loopback' } |
+                ForEach-Object {
+                    $realServers = @($_.ServerAddresses | Where-Object { $windowsDefaultV6Dns -notcontains $_ })
+                    if ($realServers.Count -gt 0) {
+                        [PSCustomObject]@{ InterfaceAlias = $_.InterfaceAlias; ServerAddresses = $realServers }
+                    }
+                })
+        if ($v6Servers.Count -gt 0) {
+            $v6Text = (@($v6Servers | ForEach-Object { "$($_.InterfaceAlias): $($_.ServerAddresses -join ', ')" }) -join '; ')
+            Add-Finding -Severity 'Info' -Title 'IPv6 DNS servers are configured' `
+                -Evidence $v6Text `
+                -Impact 'Windows prefers IPv6 when both are available, so these servers see the lookups even when the IPv4 setting points somewhere else. A machine hardened on IPv4 alone can still resolve everything through an IPv6 resolver nobody looked at.' `
+                -Confidence 'Certain'
+        } else {
+            Add-Ok -Message 'No IPv6 DNS servers beyond the Windows defaults are configured, so name resolution follows the IPv4 setting.'
+        }
+    } catch {
+        Add-Skip -Message 'IPv6 DNS servers could not be read.'
+    }
+
+    try {
+        $nrpt = @(Get-DnsClientNrptRule -ErrorAction Stop)
+        if ($nrpt.Count -gt 0) {
+            $nrptText = (@($nrpt | Select-Object -First 4 | ForEach-Object { "$($_.Namespace -join ',') -> $($_.NameServers -join ',')" }) -join '; ')
+            Add-Finding -Severity 'Medium' -Title 'Name Resolution Policy rules redirect specific domains' `
+                -Evidence ("{0} NRPT rule(s): {1}" -f $nrpt.Count, $nrptText) `
+                -Impact 'NRPT overrides the normal DNS setting for the namespaces it names, and it is applied before anything else. It is how a VPN does split DNS legitimately - and also a quiet way to send just the domains that matter to a different resolver.' `
+                -Fix 'Inspect them with: Get-DnsClientNrptRule. Rules from a VPN client disappear when the tunnel is down; anything that survives that is worth explaining.' `
+                -Confidence 'Likely'
+        } else {
+            Add-Ok -Message 'No Name Resolution Policy rules redirect DNS for specific domains.'
+        }
+    } catch {
+        Add-Skip -Message 'Name Resolution Policy rules could not be read.'
+    }
+
+    # File shares. Inferring "not sharing" from port 445 was wrong in both directions:
+    # the port is open on almost every Windows machine, and a share can exist behind it.
+    try {
+        $shares = @(Get-SmbShare -ErrorAction Stop | Where-Object { $_.Name -notmatch '^\w\$$' -and $_.Name -ne 'IPC$' })
+        if ($shares.Count -eq 0) {
+            Add-Ok -Message 'No file shares beyond the built-in administrative ones are published from this machine.'
+        } else {
+            $shareText = (@($shares | Select-Object -First 6 | ForEach-Object { "$($_.Name) -> $($_.Path)" }) -join '; ')
+            # Everyone-readable is the case worth separating out.
+            $openShares = @()
+            foreach ($share in $shares) {
+                try {
+                    $access = @(Get-SmbShareAccess -Name $share.Name -ErrorAction Stop |
+                            Where-Object { $_.AccountName -match '(?i)^(Everyone|BUILTIN\\Users|NT AUTHORITY\\Authenticated Users)$' -and [string]$_.AccessControlType -eq 'Allow' })
+                    if ($access.Count -gt 0) { $openShares += "$($share.Name) ($(($access | ForEach-Object { $_.AccountName }) -join ', '))" }
+                } catch {
+                    Write-Verbose -Message ("Share permissions for {0} could not be read: {1}" -f $share.Name, $_.Exception.Message)
+                }
+            }
+            if ($openShares.Count -gt 0) {
+                Add-Finding -Severity 'Medium' -Title 'File shares are readable by everyone on the network' `
+                    -Evidence ("{0} share(s): {1}. Broadly permitted: {2}" -f $shares.Count, $shareText, ($openShares -join '; ')) `
+                    -Impact 'Anyone who can reach port 445 on this machine can list and read these folders. On a home network that includes every device on the Wi-Fi, and on a public network it includes strangers.' `
+                    -Fix 'Remove the share, or tighten it: Get-SmbShareAccess -Name <share>, then Revoke-SmbShareAccess for Everyone and grant only the accounts that need it.' `
+                    -Confidence 'Certain'
+            } else {
+                Add-Finding -Severity 'Info' -Title 'File shares are published from this machine' `
+                    -Evidence ("{0} share(s): {1}" -f $shares.Count, $shareText) `
+                    -Impact 'Shares are reachable by anything that can talk to port 445. None of them grants access to Everyone, so this is informational.' `
+                    -Confidence 'Certain'
+            }
+        }
+    } catch {
+        Add-Skip -Message ("SMB shares could not be enumerated: {0}" -f $_.Exception.Message)
+    }
+
+    # Port proxies forward a local port somewhere else at the kernel level, and they appear
+    # in no firewall list. They are how an unexplained listening port turns out to be a
+    # bridge to another host entirely.
+    if (Get-Command -Name netsh -CommandType Application -ErrorAction SilentlyContinue) {
+        try {
+            $portproxyRaw = & netsh interface portproxy show all 2>&1 | Out-String
+            # Match address/port quadruples, which is language-independent - the table
+            # headings are translated but the rows are addresses and numbers.
+            $portproxyRows = @([regex]::Matches($portproxyRaw, '(?m)^\s*(\S+)\s+(\d{1,5})\s+(\S+)\s+(\d{1,5})\s*$') |
+                    ForEach-Object { "$($_.Groups[1].Value):$($_.Groups[2].Value) -> $($_.Groups[3].Value):$($_.Groups[4].Value)" })
+            if ($portproxyRows.Count -gt 0) {
+                Add-Finding -Severity 'Medium' -Title 'Ports on this machine are forwarded to another address' `
+                    -Evidence (($portproxyRows | Select-Object -First 6) -join '; ') `
+                    -Impact 'A port proxy accepts a connection here and forwards it somewhere else, in the kernel, below the firewall. It shows up in no rule list, and it explains listening ports that otherwise have no owning program. WSL sets these up legitimately; so does anyone wanting a quiet pivot into a network.' `
+                    -Fix 'List them with: netsh interface portproxy show all - and remove one with: netsh interface portproxy delete v4tov4 listenport=<port>' `
+                    -Confidence 'Likely'
+            } else {
+                Add-Ok -Message 'No port proxies forward traffic from this machine to another address.'
+            }
+        } catch {
+            Add-Skip -Message 'netsh interface portproxy could not be read.'
+        }
+    }
+
+    # Saved wireless profiles. The connected network is checked elsewhere; these are the
+    # ones the machine will join on its own the moment it hears the name.
+    if (Get-Command -Name netsh -CommandType Application -ErrorAction SilentlyContinue) {
+        try {
+            $wlanProfilesRaw = & netsh wlan show profiles 2>&1 | Out-String
+            # Profile names appear after a colon; the label around it is translated.
+            $wlanNames = @([regex]::Matches($wlanProfilesRaw, '(?m)^\s*\S[^:\r\n]*:\s*(\S.*?)\s*$') |
+                    ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -notmatch '^\s*$' } | Select-Object -Unique)
+            $weakProfiles = @()
+            foreach ($wlanName in $wlanNames) {
+                $detail = & netsh wlan show profile name="$wlanName" key=clear 2>&1 | Out-String
+                # Authentication and cipher values are protocol names, not translated.
+                if ($detail -match '(?i)\b(WEP|TKIP)\b') { $weakProfiles += "$wlanName (WEP or TKIP)" }
+                elseif ($detail -match '(?i)\bOpen\b' -and $detail -notmatch '(?i)\b(WPA|OWE)') { $weakProfiles += "$wlanName (open, no encryption)" }
+            }
+            if ($weakProfiles.Count -gt 0) {
+                Add-Finding -Severity 'Medium' -Title 'Saved wireless networks use no encryption or a broken one' `
+                    -Evidence (($weakProfiles | Select-Object -First 6) -join '; ') `
+                    -Impact 'The machine reconnects to a saved network automatically whenever it hears the name. An open or WEP profile means anyone can stand up an access point with that name and have this machine join it, and then read or alter the traffic. Old hotel and airport profiles are the usual culprits.' `
+                    -Fix 'Settings > Network & internet > Wi-Fi > Manage known networks - forget the ones you do not need. From PowerShell: netsh wlan delete profile name="<name>"' `
+                    -Confidence 'Likely'
+            } elseif ($wlanNames.Count -gt 0) {
+                Add-Ok -Message ("All {0} saved wireless profile(s) use modern encryption - none is open, WEP or TKIP." -f $wlanNames.Count)
+            }
+        } catch {
+            Add-Skip -Message 'Saved wireless profiles could not be read.'
+        }
     }
 }
 
@@ -6273,6 +6745,286 @@ function Test-SecurityHealth {
             }
         } catch {
             Add-Skip -Message ("WMI event subscriptions could not be read: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    # 19. Defender detection history
+    # Whether Defender is configured correctly is one question; whether it has actually
+    # caught something, and whether that something was dealt with, is a different one.
+    # A threat still sitting at Detected or Failed means the file is where it was.
+    if (-not (Get-Command -Name Get-MpThreatDetection -ErrorAction SilentlyContinue)) {
+        Add-Skip -Message 'Defender detection history was not read - Get-MpThreatDetection is not available on this machine.'
+    } else {
+        try {
+            $detections = @(Get-MpThreatDetection -ErrorAction Stop)
+            if ($detections.Count -eq 0) {
+                Add-Ok -Message 'Defender has no recorded threat detections on this machine.'
+            } else {
+                # ThreatStatusID: 2 = Quarantined, 3 = Removed, 6 = Cleaned are resolved.
+                # 1 = Detected and 4 = Cleaned-failed / still present are not.
+                $unresolved = @($detections | Where-Object { @(2, 3, 6) -notcontains [int]$_.ThreatStatusID })
+                $recent = @($detections | Sort-Object InitialDetectionTime -Descending | Select-Object -First 3 |
+                        ForEach-Object { "$($_.InitialDetectionTime) status $($_.ThreatStatusID)" })
+                if ($unresolved.Count -gt 0) {
+                    Add-Finding -Severity High -Title 'Defender has detections that were never resolved' `
+                        -Evidence ("{0} of {1} detection(s) are not quarantined, removed or cleaned. Most recent: {2}" -f $unresolved.Count, $detections.Count, ($recent -join '; ')) `
+                        -Impact 'Defender found something and did not finish dealing with it. The file is most likely still where it was found, and a detection that keeps coming back usually means the source has not been removed.' `
+                        -Fix 'Open Windows Security > Virus & threat protection > Protection history and act on each item. From PowerShell: Get-MpThreatDetection | Select-Object InitialDetectionTime,ThreatStatusID,Resources' `
+                        -Confidence Likely
+                } else {
+                    Add-Finding -Severity Info -Title 'Defender has resolved detections in its history' `
+                        -Evidence ("{0} detection(s), all quarantined, removed or cleaned. Most recent: {1}" -f $detections.Count, ($recent -join '; ')) `
+                        -Impact 'Nothing outstanding. Worth knowing about, because a history full of the same detection points at a source that keeps reintroducing it.' `
+                        -Confidence Certain
+                }
+            }
+        } catch {
+            Add-Skip -Message ("Defender detection history could not be read: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    # 20. BitLocker key protectors
+    # An encrypted volume with no recovery password is a volume you can lose permanently:
+    # a firmware update that resets the TPM leaves nothing to unlock it with.
+    if (-not $ctx.IsAdmin) {
+        Add-Skip -Message 'BitLocker key protectors were not enumerated - it requires administrator rights.'
+    } elseif (-not (Get-Command -Name Get-BitLockerVolume -ErrorAction SilentlyContinue)) {
+        Add-Skip -Message 'BitLocker key protectors were not enumerated - Get-BitLockerVolume is not available on this edition.'
+    } else {
+        try {
+            $protectedVolumes = @(Get-BitLockerVolume -ErrorAction Stop | Where-Object { [string]$_.ProtectionStatus -eq 'On' })
+            if ($protectedVolumes.Count -eq 0) {
+                Add-Skip -Message 'No BitLocker-protected volumes on this machine, so key protectors were not assessed.'
+            } else {
+                $withoutRecovery = @()
+                foreach ($volume in $protectedVolumes) {
+                    $types = @($volume.KeyProtector | ForEach-Object { [string]$_.KeyProtectorType })
+                    if ($types -notcontains 'RecoveryPassword') {
+                        $withoutRecovery += "$($volume.MountPoint) has only: $(($types | Sort-Object -Unique) -join ', ')"
+                    }
+                }
+                if ($withoutRecovery.Count -gt 0) {
+                    Add-Finding -Severity High -Title 'An encrypted volume has no recovery password' `
+                        -Evidence ($withoutRecovery -join '; ') `
+                        -Impact 'Without a recovery password there is exactly one way in. A UEFI or fTPM firmware update that resets the TPM, a motherboard replacement, or a Secure Boot change then leaves the data unreadable with no way back - this is the most common cause of permanent BitLocker data loss.' `
+                        -Fix 'Add one as administrator: manage-bde -protectors -add <drive> -RecoveryPassword, then save it: manage-bde -protectors -get <drive>. Back it up to your Microsoft account or print it - not to the encrypted disk itself.' `
+                        -Confidence Certain
+                } else {
+                    Add-Ok -Message ("All {0} BitLocker-protected volume(s) have a recovery password protector." -f $protectedVolumes.Count)
+                }
+            }
+        } catch {
+            Add-Skip -Message ("BitLocker key protectors could not be read: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    # 21. VBS and HVCI: configured versus actually running
+    # SecurityServicesConfigured says what was asked for, SecurityServicesRunning says what
+    # the hypervisor actually started. When they disagree something is blocking it, and the
+    # machine has the protection turned on in the interface while not having it at all.
+    try {
+        $deviceGuard = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction Stop
+        $configured = @($deviceGuard.SecurityServicesConfigured)
+        $running = @($deviceGuard.SecurityServicesRunning)
+        $serviceNames = @{ 1 = 'Credential Guard'; 2 = 'Memory integrity (HVCI)'; 3 = 'System Guard'; 4 = 'SMM firmware measurement'; 5 = 'Kernel-mode hardware-enforced stack protection' }
+        $notRunning = @($configured | Where-Object { $running -notcontains $_ })
+        if ($notRunning.Count -gt 0) {
+            $notRunningText = (@($notRunning | ForEach-Object { if ($serviceNames.ContainsKey([int]$_)) { $serviceNames[[int]$_] } else { "service $_" } }) -join ', ')
+            Add-Finding -Severity Medium -Title 'A virtualization-based protection is configured but not running' `
+                -Evidence ("SecurityServicesConfigured = [{0}], SecurityServicesRunning = [{1}]. Not running: {2}. VirtualizationBasedSecurityStatus = {3}." -f ($configured -join ', '), ($running -join ', '), $notRunningText, $deviceGuard.VirtualizationBasedSecurityStatus) `
+                -Impact 'The setting is on in Windows Security, but the hypervisor never started the service. The usual cause is an incompatible kernel driver - often from an old VPN client, an anti-cheat, or a virtualization product - which leaves the machine with the protection switched on and absent at the same time.' `
+                -Fix 'Find the blocking driver: the System log, source Microsoft-Windows-DeviceGuard, records why. Windows Security > Device security > Core isolation details also names incompatible drivers. Update or remove that driver and restart.' `
+                -Confidence Certain
+        } elseif ($configured.Count -gt 0) {
+            Add-Ok -Message ("Every configured virtualization-based protection is actually running ({0})." -f ($configured -join ', '))
+        }
+    } catch {
+        Add-Skip -Message 'Win32_DeviceGuard could not be read, so configured-versus-running VBS state was not compared.'
+    }
+
+    # 22. Boot configuration flags
+    # These are the switches that turn off the protections everything else here assumes.
+    # testsigning lets unsigned kernel drivers load; nointegritychecks removes the check
+    # entirely; a kernel debugger lets another machine read and write this one's memory.
+    # They are read from the BCD store through WMI so no external tool is needed.
+    # Read the mounted BCD hive rather than parsing bcdedit output: the element names are
+    # numeric codes and the values are raw bytes, so nothing here depends on the display
+    # language. bcdedit prints "Yes"/"No", which is translated. The WMI BcdStore provider
+    # was the other candidate and it refuses to open the system store even elevated.
+    $bcdFlags = @()
+    $bcdRead = $false
+    try {
+        $bcdObjects = @(Get-ChildItem -LiteralPath 'HKLM:\BCD00000000\Objects' -ErrorAction Stop)
+        $bcdRead = ($bcdObjects.Count -gt 0)
+        # BcdLibraryBoolean_* element codes. 12000004 is the entry description.
+        $bootChecks = @{
+            '16000049' = @{ Name = 'testsigning'; Means = 'unsigned kernel drivers are allowed to load' }
+            '16000048' = @{ Name = 'nointegritychecks'; Means = 'driver signature enforcement is switched off entirely' }
+            '16000010' = @{ Name = 'kernel debugging'; Means = 'another machine can read and write this one memory over the debug transport' }
+        }
+        foreach ($bcdObject in $bcdObjects) {
+            foreach ($code in $bootChecks.Keys) {
+                $elementKey = Join-Path $bcdObject.PSPath "Elements\$code"
+                if (-not (Test-Path -LiteralPath $elementKey)) { continue }
+                $element = (Get-ItemProperty -LiteralPath $elementKey -ErrorAction SilentlyContinue).Element
+                # Boolean elements are a single byte: 01 = on.
+                $isOn = ($element -is [byte[]] -and $element.Length -ge 1 -and $element[0] -eq 1)
+                if (-not $isOn) { continue }
+                $descriptionKey = Join-Path $bcdObject.PSPath 'Elements\12000004'
+                $entryName = [string](Get-ItemProperty -LiteralPath $descriptionKey -ErrorAction SilentlyContinue).Element
+                if ([string]::IsNullOrWhiteSpace($entryName)) { $entryName = $bcdObject.PSChildName }
+                $bcdFlags += "$($bootChecks[$code].Name) is on for '$entryName' - $($bootChecks[$code].Means)"
+            }
+        }
+        if (-not $bcdRead) {
+            Add-Skip -Message 'The BCD hive holds no boot objects, so boot configuration flags were not assessed.'
+        } elseif ($bcdFlags.Count -gt 0) {
+            Add-Finding -Severity High -Title 'The boot configuration disables a kernel protection' `
+                -Evidence ($bcdFlags -join '; ') `
+                -Impact 'These flags are meant for driver development. Left on, they undo driver signature enforcement - the thing that stops a vulnerable or malicious kernel driver from loading, which is the route the whole vulnerable-driver blocklist exists to block. Some anti-cheat and DRM systems also refuse to run.' `
+                -Fix 'As administrator: bcdedit /set testsigning off, bcdedit /set nointegritychecks off, bcdedit /debug off - then restart. Check with: bcdedit /enum {current}' `
+                -Confidence Certain
+        } else {
+            Add-Ok -Message ("None of the {0} boot entries has a kernel protection switched off (testsigning, nointegritychecks and kernel debugging are all off)." -f $bcdObjects.Count)
+        }
+    } catch {
+        Add-Skip -Message 'The BCD hive (HKLM:\BCD00000000) could not be read, so boot configuration flags were not assessed - it requires administrator rights.'
+    }
+
+    # 23. Certificates that exist only in the per-user store
+    # Cert:\CurrentUser\Root returns the machine store merged in, so comparing counts there
+    # says nothing. The registry is where a purely per-user root actually lives, and that is
+    # the interesting case: it needs no administrator rights to install.
+    try {
+        $userOnlyRootKey = 'HKCU:\SOFTWARE\Microsoft\SystemCertificates\Root\Certificates'
+        $machineRootKey = 'HKLM:\SOFTWARE\Microsoft\SystemCertificates\Root\Certificates'
+        $userThumbprints = @(Get-ChildItem -LiteralPath $userOnlyRootKey -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PSChildName)
+        $machineThumbprints = @(Get-ChildItem -LiteralPath $machineRootKey -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PSChildName)
+        $userOnly = @($userThumbprints | Where-Object { $machineThumbprints -notcontains $_ })
+        if ($userOnly.Count -eq 0) {
+            Add-Ok -Message 'No root certificates exist only in the per-user store - nothing was installed as trusted without administrator rights.'
+        } else {
+            $userOnlyNames = @($userOnly | ForEach-Object {
+                    $cert = Get-Item -LiteralPath ("Cert:\CurrentUser\Root\{0}" -f $_) -ErrorAction SilentlyContinue
+                    if ($cert) { $cert.Subject } else { $_ }
+                } | Select-Object -First 5)
+            Add-Finding -Severity Medium -Title 'Root certificates are trusted for this user only' `
+                -Evidence ("{0} certificate(s) exist in HKCU but not in the machine store: {1}" -f $userOnly.Count, ($userOnlyNames -join '; ')) `
+                -Impact 'A root certificate in the per-user store is trusted by every browser and program running as you, and installing one needs no administrator rights at all. That makes it the easy way to set up HTTPS interception, and it is invisible to any check that only looks at the machine store.' `
+                -Fix 'Open certmgr.msc (not certlm.msc) > Trusted Root Certification Authorities > Certificates and confirm you recognise each one. Development tools like mkcert and Fiddler put legitimate certificates here.' `
+                -Confidence Likely
+        }
+    } catch {
+        Add-Skip -Message 'The per-user root certificate store could not be read.'
+    }
+
+    # 24. Secure Boot revocation list (dbx)
+    # An empty or tiny dbx means the firmware never received the revocations that block
+    # the known-vulnerable bootloaders, so Secure Boot is on but not stopping much.
+    if ($null -ne $secureBootOn -and $true -eq $secureBootOn) {
+        try {
+            $dbx = Get-SecureBootUEFI -Name dbx -ErrorAction Stop
+            $dbxBytes = @($dbx.Bytes).Count
+            # A current dbx on Windows 11 is tens of kilobytes. Anything under a few KB
+            # means the machine never got the revocation updates.
+            if ($dbxBytes -lt 4096) {
+                Add-Finding -Severity Medium -Title 'The Secure Boot revocation list looks out of date' `
+                    -Evidence ("The UEFI dbx variable is {0} bytes. A current revocation list on Windows 11 is tens of kilobytes." -f ('{0:N0}' -f $dbxBytes)) `
+                    -Impact 'Secure Boot is on, but the firmware has not received the list of revoked bootloaders. The signed-but-vulnerable bootloaders behind BlackLotus and similar bootkits are then still accepted, which is most of what Secure Boot is supposed to stop.' `
+                    -Fix 'Install all Windows updates - Microsoft ships dbx updates through Windows Update. Some boards also need a UEFI firmware update from the vendor. Check the size afterwards with: (Get-SecureBootUEFI -Name dbx).Bytes.Count' `
+                    -Confidence Likely
+            } else {
+                Add-Ok -Message ("The Secure Boot revocation list (dbx) is {0:N0} bytes, so the firmware has received revocation updates." -f $dbxBytes)
+            }
+        } catch {
+            Add-Skip -Message 'The Secure Boot dbx variable could not be read (it needs administrator rights and a UEFI machine).'
+        }
+    }
+
+    # 25. Delegated: PrivescCheck
+    # Privilege-escalation surface - weak service ACLs, unquoted service paths, writable
+    # entries in %PATH%, DLL hijack candidates. This script deliberately does not
+    # reimplement any of that: itm4n maintains it, it is a large body of careful work, and
+    # copying the checks out of it would be taking the work without the credit. So it is
+    # invoked, if the caller has it, and the result is attributed.
+    if ($PrivescCheckPath) {
+        Write-Host '    running PrivescCheck (this takes a while)...' -ForegroundColor DarkGray
+        # -Audit adds the configuration checks, -Silent suppresses its own banner, and CSV
+        # is the one stable, parseable output it offers. -Report makes it write a file,
+        # which is the only disk write anywhere in this script - so it goes to a uniquely
+        # named temporary path and is deleted again in the finally block below. The header
+        # and the README both say so rather than leaving the reader to discover it.
+        $privescPrefix = Join-Path ([IO.Path]::GetTempPath()) ("privesc-{0}" -f [guid]::NewGuid().ToString('N'))
+        $privescCsv = "$privescPrefix.csv"
+        try {
+            $privescExpression = ". '$($PrivescCheckPath -replace "'", "''")'; Invoke-PrivescCheck -Audit -Silent -Format CSV -Report '$($privescPrefix -replace "'", "''")'"
+            $privescRun = Invoke-ExternalAudit -ScriptPath $PrivescCheckPath -Expression $privescExpression -TimeoutSeconds 600
+            if (-not $privescRun.Ok) {
+                Add-Skip -Message ("PrivescCheck was not run: {0}" -f $privescRun.Reason)
+            }
+            elseif (-not (Test-Path -LiteralPath $privescCsv)) {
+                Add-Skip -Message 'PrivescCheck ran but wrote no CSV report, so its findings could not be read.'
+            }
+            else {
+                $privescRows = @(Import-Csv -LiteralPath $privescCsv -ErrorAction Stop)
+                # Its severity column is High/Medium/Low/Info; map onto ours and keep only
+                # what it actually flagged rather than every check it ran.
+                $privescHits = @($privescRows | Where-Object { $_.Severity -and $_.Severity -notmatch '(?i)^(none|info)$' })
+                if ($privescHits.Count -eq 0) {
+                    Add-Ok -Message ("PrivescCheck found no privilege-escalation issues ({0} checks run). Attribution: itm4n/PrivescCheck, BSD-3-Clause." -f $privescRows.Count)
+                } else {
+                    foreach ($severityName in 'High', 'Medium', 'Low') {
+                        $group = @($privescHits | Where-Object { $_.Severity -match "(?i)^$severityName$" })
+                        if ($group.Count -eq 0) { continue }
+                        $titles = (@($group | Select-Object -First 6 | ForEach-Object { $_.Description }) -join '; ')
+                        Add-Finding -Severity $severityName -Title ("PrivescCheck reports {0} {1}-severity privilege-escalation finding(s)" -f $group.Count, $severityName.ToLower()) `
+                            -Evidence $titles `
+                            -Impact 'These come from PrivescCheck (itm4n, BSD-3-Clause), not from this script. They cover the local privilege-escalation surface: service and file permissions, unquoted paths, and writable locations that a standard user could abuse to become administrator.' `
+                            -Fix 'Run PrivescCheck directly for the full detail on each item. It skips many of its checks when run elevated, so run it - and this script - as an ordinary user for its complete output.' `
+                            -Confidence Likely
+                    }
+                }
+            }
+        } catch {
+            Add-Skip -Message ("PrivescCheck output could not be parsed: {0}" -f $_.Exception.Message)
+        } finally {
+            # Leave nothing behind: the report file existing is the only way this script
+            # ever touches the disk, and it must not outlive the run that caused it.
+            # -LiteralPath on the directory with -Filter on the leaf, not -Path with a
+            # wildcard: TEMP sits under the user profile, and a username containing [ or ]
+            # would make -Path treat it as a character class, silently match nothing, and
+            # leave the report behind. Same trap as the registry read earlier in this file.
+            $privescDir = Split-Path -Path $privescPrefix -Parent
+            $privescLeaf = Split-Path -Path $privescPrefix -Leaf
+            foreach ($leftover in @(Get-ChildItem -LiteralPath $privescDir -Filter "$privescLeaf.*" -File -ErrorAction SilentlyContinue)) {
+                Remove-Item -LiteralPath $leftover.FullName -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    # 26. LSA protection: does lsass actually run protected?
+    # RunAsPPL in the registry is what was asked for. Wininit event 12 is what happened at
+    # boot. They differ when the setting was added but the machine has not restarted, or
+    # when firmware locked the setting out.
+    if ($ctx.IsAdmin) {
+        $runAsPplValue = Get-RegValue -Path $lsaKey -Name 'RunAsPPL'
+        if ($null -ne $runAsPplValue -and [int]$runAsPplValue -ge 1) {
+            $lsassProtected = $null
+            try {
+                $wininitEvents = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Wininit'; Id = 12 } -MaxEvents 5 -ErrorAction Stop)
+                if ($wininitEvents.Count -gt 0) { $lsassProtected = $true }
+            } catch {
+                Write-Verbose -Message ("No Wininit event 12 found: {0}" -f $_.Exception.Message)
+            }
+            if ($true -eq $lsassProtected) {
+                Add-Ok -Message 'LSA protection is not just configured - Wininit event 12 confirms LSASS actually started as a protected process.'
+            } else {
+                Add-Finding -Severity Medium -Title 'LSA protection is configured, but nothing confirms it took effect' `
+                    -Evidence ("RunAsPPL = {0} under {1}, but no Wininit event 12 (LSASS started as a protected process) was found in the System log." -f $runAsPplValue, $lsaKey) `
+                    -Impact 'The registry value is what was asked for; the event is what happened. They differ when the machine has not restarted since the value was set, or when firmware or a driver stopped LSASS from starting protected - and then credential theft against LSASS is not blocked even though the setting says it is.' `
+                    -Fix 'Restart the machine if the setting is new. Afterwards confirm with: Get-WinEvent -FilterHashtable @{LogName=''System''; ProviderName=''Microsoft-Windows-Wininit''; Id=12}' `
+                    -Confidence Likely
+            }
         }
     }
 }
@@ -7764,14 +8516,63 @@ function Test-LoggingHealth {
                     Write-Verbose -Message ("No Sysmon events with ID 255 in the window: {0}" -f $_.Exception.Message)
                 }
                 if ($dropped.Count -gt 0) {
-                    $newestDrop = (([string]$dropped[0].Message) -replace '\s+', ' ').Trim()
-                    if ($newestDrop.Length -gt 200) { $newestDrop = $newestDrop.Substring(0, 200) }
-                    if (-not $newestDrop) { $newestDrop = 'ID: QUEUE' }
-                    Add-Finding -Severity High -Title 'Sysmon is losing events because the queue fills up' `
-                        -Evidence ("{0} events with ID 255 and QUEUE in the last 7 days. Newest, {1}: {2}" -f $dropped.Count, $dropped[0].TimeCreated, $newestDrop) `
-                        -Impact 'Events disappear before they are written. The log looks complete, but has gaps exactly when the machine is busiest, and that is often when something is happening.' `
-                        -Fix 'Reduce the volume in the sysmon configuration (filter out RegistryEvent noise and frequent ImageLoad) and reload it with sysmon -c <config.xml> as administrator.' `
-                        -Confidence Certain
+                    # When the drops happened decides what to do about them, and the two
+                    # cases want opposite advice. Drops spread across many hours mean the
+                    # configuration collects more than this machine can sustain, and the
+                    # answer is to trim it. Drops confined to a single hour mean one load
+                    # spike - a driver install, a large build, a backup - overran the
+                    # driver queue once. Trimming the configuration for that costs
+                    # visibility every other hour of the week and buys nothing.
+                    $dropHours = @($dropped | Group-Object { $_.TimeCreated.ToString('yyyy-MM-dd HH') })
+                    $busiestHour = ($dropHours | Sort-Object Count -Descending | Select-Object -First 1)
+                    $concentration = if ($dropped.Count -gt 0) { $busiestHour.Count / $dropped.Count } else { 0 }
+                    # How many events were actually lost, where the message says so.
+                    $lostTotal = 0
+                    foreach ($dropEvent in $dropped) {
+                        if ([string]$dropEvent.Message -match 'queue:\s*\w+:(\d+)') { $lostTotal += [int]$Matches[1] }
+                    }
+                    $lostText = if ($lostTotal -gt 0) { " Roughly {0:N0} events were lost." -f $lostTotal } else { '' }
+                    # Which event type overran the queue - that is what would have to be
+                    # trimmed, and naming it saves the reader from opening the log.
+                    $dropTypes = @{}
+                    foreach ($dropEvent in $dropped) {
+                        if ([string]$dropEvent.Message -match 'queue:\s*(\w+):(\d+)') {
+                            $dropTypes[$Matches[1]] = ([int]$dropTypes[$Matches[1]]) + [int]$Matches[2]
+                        }
+                    }
+                    $dropTypeText = if ($dropTypes.Count -gt 0) {
+                        ' Mostly ' + (($dropTypes.GetEnumerator() | Sort-Object Value -Descending |
+                            Select-Object -First 2 | ForEach-Object { "$($_.Key) ({0:N0})" -f $_.Value }) -join ', ') + '.'
+                    } else { '' }
+
+                    # One hour holding almost everything is a spike, not a trend.
+                    $isSingleBurst = ($dropHours.Count -eq 1 -or $concentration -ge 0.9)
+                    # Spread alone is not enough to call it recurring. Two drop notifications
+                    # in two different hours over a week is noise, and calling that High
+                    # teaches the reader to skip the finding the week it actually matters.
+                    # Magnitude has to clear a floor before "the configuration is too heavy"
+                    # is a fair conclusion.
+                    $isOccasional = (-not $isSingleBurst -and $dropped.Count -lt 5)
+
+                    if ($isSingleBurst) {
+                        Add-Finding -Severity 'Low' -Title 'Sysmon lost events during a single burst of activity' `
+                            -Evidence ("{0} events with ID 255 and QUEUE in the last 7 days, and {1} of them fall in the single hour starting {2}.{3}{4}" -f $dropped.Count, $busiestHour.Count, $busiestHour.Name, $lostText, $dropTypeText) `
+                            -Impact 'The driver queue overran once, during whatever was running in that hour - a driver or feature install, a large build, or a backup are the usual causes. There is a gap in the log for that period, but the configuration is sustainable the rest of the time.' `
+                            -Fix 'Nothing needs changing. Trimming the configuration to survive a one-off spike would cost visibility every other hour of the week. If drops start appearing in separate hours on different days, that is the point at which the configuration is genuinely too heavy.' `
+                            -Confidence 'Likely'
+                    } elseif ($isOccasional) {
+                        Add-Finding -Severity 'Low' -Title 'Sysmon occasionally loses events when the queue fills' `
+                            -Evidence ("{0} events with ID 255 and QUEUE in the last 7 days, in {1} separate hours.{2}{3}" -f $dropped.Count, $dropHours.Count, $lostText, $dropTypeText) `
+                            -Impact 'A handful of drops across a week means the machine briefly outruns the queue now and then, leaving small gaps. It is worth knowing about, but it is not the pattern of a configuration that is too heavy for the machine.' `
+                            -Fix 'Nothing needs doing yet. If the count keeps climbing week over week, trim the noisiest event type named above and reload with: sysmon -c <config.xml>' `
+                            -Confidence 'Likely'
+                    } else {
+                        Add-Finding -Severity High -Title 'Sysmon is repeatedly losing events because the queue fills up' `
+                            -Evidence ("{0} events with ID 255 and QUEUE in the last 7 days, spread over {1} separate hours.{2}{3} Newest: {4}." -f $dropped.Count, $dropHours.Count, $lostText, $dropTypeText, $dropped[0].TimeCreated) `
+                            -Impact 'Events disappear before they are written, and it keeps happening. The log looks complete but has gaps exactly when the machine is busiest, which is often when something is happening. Unlike a one-off spike, this means the configuration collects more than this machine can sustain.' `
+                            -Fix 'Trim the noisiest event type named above in the sysmon configuration - RegistryEvent and ImageLoad are almost always the two - and reload it as administrator with: sysmon -c <config.xml>. Then check back in a few days to confirm the drops have stopped.' `
+                            -Confidence Certain
+                    }
                 } else {
                     Add-Ok -Message 'Sysmon has not lost events to a full queue in the last 7 days.'
                 }
@@ -7802,6 +8603,23 @@ function Test-LoggingHealth {
                     23 = 'file deleted'
                     25 = 'process tampering'
                 }
+                # 23 (FileDelete, archives the file) and 26 (FileDeleteDetected, logs only)
+                # answer the same question. A configuration that chose 26 to avoid filling
+                # the disk must not be reported as having no coverage of file deletion.
+                $sysmonEquivalent = @{ 23 = 26 }
+                # Some of these fire constantly and some almost never. Event 1 is written
+                # on every process start, so its absence really does mean the rule group is
+                # off. Events 8, 10 and 25 describe things that should not happen at all on
+                # a healthy machine - a week without one is the expected result, not a gap.
+                # Reporting both the same way turns a correctly configured machine into a
+                # finding, which is how a check trains people to ignore it.
+                #
+                # Event 7 belongs here too, and for a less obvious reason. ImageLoad
+                # unfiltered is the highest-volume event Sysmon produces, so every usable
+                # configuration scopes it down hard - typically to DLLs loading from places
+                # they have no business loading from. Scoped that way it is supposed to stay
+                # silent, and a quiet week means the machine is clean rather than unmonitored.
+                $sysmonRareByNature = @(7, 8, 10, 25)
                 # The cap matters for what may be claimed afterwards. Get-WinEvent returns the
                 # NEWEST events first, so on a busy machine 20000 records can be a few hours
                 # rather than seven days - and a rule group that fires rarely would then be
@@ -7827,25 +8645,43 @@ function Test-LoggingHealth {
                 if ($seenIds.Count -eq 0) {
                     Add-Skip -Message 'No Sysmon events in the last 7 days, so which event types the configuration collects could not be determined.'
                 } else {
-                    $missing = @($sysmonWanted.Keys | Where-Object { $seenIds -notcontains $_ } | Sort-Object)
+                    $missing = @($sysmonWanted.Keys | Where-Object {
+                            if ($seenIds -contains $_) { return $false }
+                            # An accepted stand-in counts as coverage.
+                            if ($sysmonEquivalent.ContainsKey($_) -and $seenIds -contains $sysmonEquivalent[$_]) { return $false }
+                            return $true
+                        } | Sort-Object)
                     # Event 1 is written on every process start, so a sample this size always
                     # contains it on a live machine. Its absence means the config is filtering
                     # almost everything out, not that the machine has been idle.
-                    if ($missing.Count -eq 0) {
-                        Add-Ok -Message ("All {0} high-value Sysmon event types checked have arrived within the last {1}." -f $sysmonWanted.Count, $windowText)
+                    # Split the absences by what absence actually means for that event type.
+                    $missingCommon = @($missing | Where-Object { $sysmonRareByNature -notcontains $_ })
+                    $missingRare = @($missing | Where-Object { $sysmonRareByNature -contains $_ })
+                    $capNote = if ($sampleCount -ge 20000) { " The sample hit the 20000-event cap, so it covers only the most recent activity." } else { '' }
+
+                    if ($missingCommon.Count -eq 0) {
+                        # Everything that should be there is there. Anything still missing is
+                        # an event that describes an attack, and not seeing one is the goal.
+                        $rareNote = if ($missingRare.Count -gt 0) {
+                            " {0} did not occur, which is the expected result - those events describe an attack rather than normal activity." -f
+                                (@($missingRare | ForEach-Object { "$_ ($($sysmonWanted[$_]))" }) -join ', ')
+                        } else { '' }
+                        Add-Ok -Message ("Every Sysmon event type that should appear on a running machine has arrived within the last {0}.{1}" -f $windowText, $rareNote)
                     } else {
-                        $missingText = (@($missing | ForEach-Object { "$_ ($($sysmonWanted[$_]))" }) -join ', ')
-                        $severity = if ($missing -contains 1 -or $missing -contains 3) { 'Medium' } else { 'Low' }
-                        # This measures the channel, not the configuration file, so absence is
-                        # evidence rather than proof: an event type can be configured and simply
-                        # not have occurred - ID 8 and 10 are genuinely rare on an idle desktop.
-                        # Say what was measured and let the reader confirm with "sysmon -c".
-                        $capNote = if ($sampleCount -ge 20000) { " The sample hit the 20000-event cap, so it covers only the most recent activity - a rarer event type may exist further back." } else { '' }
-                        Add-Finding -Severity $severity -Title 'High-value Sysmon event types are not arriving' `
-                            -Evidence ("In a sample of {0} events covering the last {1}, the channel has written IDs {2}. Not seen in that window: {3}.{4}" -f ('{0:N0}' -f $sampleCount), $windowText, (($seenIds | Sort-Object) -join ', '), $missingText, $capNote) `
-                            -Impact 'Sysmon looks healthy and the service is running, but nothing of these types has been recorded in the sample. The usual cause is that the rule group is turned off in the configuration - FileDelete, ClipboardChange and ProcessTampering ship commented out in several widely used configurations - and then ransomware wiping files or code injected into a live process passes without a trace. A rare event type that simply did not occur in the window looks identical here, so confirm before acting.' `
-                            -Fix 'Print the configuration actually in effect as administrator: sysmon -c. If the rule group for a missing ID is absent, uncomment it in your configuration file and reload with: sysmon -c <config.xml>. Event 16 in the channel records every configuration change.' `
-                            -Confidence Uncertain
+                        $missingText = (@($missingCommon | ForEach-Object { "$_ ($($sysmonWanted[$_]))" }) -join ', ')
+                        $rareText = if ($missingRare.Count -gt 0) {
+                            " Also not seen, but expected not to be: {0} - those describe an attack rather than normal activity." -f
+                                (@($missingRare | ForEach-Object { "$_ ($($sysmonWanted[$_]))" }) -join ', ')
+                        } else { '' }
+                        # Event 1 fires on every process start, so a sample this size always
+                        # contains it on a live machine. Its absence means the configuration
+                        # is filtering nearly everything out, not that the machine was idle.
+                        $severity = if ($missingCommon -contains 1 -or $missingCommon -contains 3) { 'Medium' } else { 'Low' }
+                        Add-Finding -Severity $severity -Title 'Sysmon event types that should be arriving are not' `
+                            -Evidence ("In a sample of {0} events covering the last {1}, the channel has written IDs {2}. Not seen: {3}.{4}{5}" -f ('{0:N0}' -f $sampleCount), $windowText, (($seenIds | Sort-Object) -join ', '), $missingText, $rareText, $capNote) `
+                            -Impact 'These event types describe ordinary activity that happens continuously on a running machine, so a window this long with none of them means the rule group is not collecting. Sysmon looks healthy and the service is running, but that part of the picture is simply not being recorded.' `
+                            -Fix 'Print the configuration actually in effect as administrator: sysmon -c. If the rule group for a missing ID is absent or filtered down to nothing, fix it there and reload with: sysmon -c <config.xml>. Event 16 in the channel records every configuration change.' `
+                            -Confidence Likely
                     }
                 }
 
@@ -7864,6 +8700,82 @@ function Test-LoggingHealth {
                 } catch {
                     Write-Verbose -Message ("No Sysmon event 16 found: {0}" -f $_.Exception.Message)
                 }
+            }
+        }
+    }
+
+    # Delegated: DeepBlueCLI
+    # Everything above measures whether the logging exists and reaches far enough back.
+    # This reads what is actually IN it - suspicious command lines in 4688, obfuscated
+    # PowerShell in 4104, password spraying in 4625. DeepBlueCLI is GPL-3.0 and this
+    # project is MIT, so it is never bundled: running it as a separate program is what
+    # the GPL allows without any obligation on this code, and it also means Eric Conrad
+    # and the SANS team keep the credit for their detection work.
+    if ($DeepBlueCliPath) {
+        if ($Fast) {
+            Add-Skip -Message 'DeepBlueCLI was not run because -Fast is set - it reads whole event logs and takes minutes.'
+        } else {
+            # The two tools are not independent: DeepBlueCLI reads 4688 command lines and
+            # 4104 script blocks, and this script is what verifies those are being written.
+            # On a machine where Process Creation auditing is off, DeepBlueCLI returns a
+            # clean result because there is nothing to read - which is the most misleading
+            # possible outcome. Say so next to its verdict rather than letting the absence
+            # of findings read as an absence of problems.
+            $deepBlueBlind = @()
+            # Reuse what the audit-policy check above already worked out. Re-running
+            # auditpol here and matching its output for the word "success" would have been
+            # wrong twice over: it is translated on a localised Windows, and $auditRaw is
+            # already the audit block's variable, so writing to it again would have quietly
+            # clobbered state inside the same function. $auditStates is keyed by GUID,
+            # which auditpol does not translate.
+            if ($auditReadable -and [string]$auditStates[$processCreationGuid] -eq 'Off') {
+                $deepBlueBlind += 'Process Creation auditing is off, so there are no 4688 command lines to analyse'
+            }
+            if ([int](Get-RegValue -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' -Name 'ProcessCreationIncludeCmdLine_Enabled') -ne 1) {
+                $deepBlueBlind += 'process events do not carry the command line, so 4688 analysis has almost nothing to work with'
+            }
+            if ([int](Get-RegValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging' -Name 'EnableScriptBlockLogging') -ne 1) {
+                $deepBlueBlind += 'Script Block Logging is off, so there are no decoded 4104 events to analyse'
+            }
+
+            $deepBlueFindings = @()
+            $deepBlueFailures = @()
+            foreach ($logName in 'security', 'system', 'powershell') {
+                Write-Host ("    running DeepBlueCLI against the {0} log..." -f $logName) -ForegroundColor DarkGray
+                # Its own output is objects; Format-List gives stable text without needing
+                # to guess property names that differ between its releases.
+                $deepBlueExpression = "& '$($DeepBlueCliPath -replace "'", "''")' -log $logName | Format-List | Out-String -Width 400"
+                $deepBlueRun = Invoke-ExternalAudit -ScriptPath $DeepBlueCliPath -Expression $deepBlueExpression -TimeoutSeconds 600
+                if (-not $deepBlueRun.Ok) {
+                    $deepBlueFailures += "$logName ($($deepBlueRun.Reason))"
+                    continue
+                }
+                # A clean log produces no output at all; anything present is a detection.
+                $messages = @($deepBlueRun.Lines | Where-Object { $_ -match '(?i)^\s*Message\s*:\s*(\S.*)$' } |
+                        ForEach-Object { ($_ -replace '(?i)^\s*Message\s*:\s*', '').Trim() })
+                foreach ($message in $messages) { $deepBlueFindings += "[$logName] $message" }
+            }
+
+            if ($deepBlueFailures.Count -gt 0 -and $deepBlueFindings.Count -eq 0) {
+                Add-Skip -Message ("DeepBlueCLI could not be run: {0}" -f ($deepBlueFailures -join '; '))
+            } elseif ($deepBlueFindings.Count -eq 0 -and $deepBlueBlind.Count -gt 0) {
+                # Nothing found, but it was looking at logs that are not being written.
+                Add-Finding -Severity 'Medium' -Title 'DeepBlueCLI found nothing, but the logs it reads are not being collected' `
+                    -Evidence ($deepBlueBlind -join '; ') `
+                    -Impact 'A clean result here means nothing. DeepBlueCLI analyses the contents of 4688 and 4104 events, and those are not being recorded on this machine - so it read empty logs and reported no findings. That is the most misleading possible outcome: it looks like a pass.' `
+                    -Fix 'Turn the logging on first, then run again. The audit-policy and Script Block Logging findings elsewhere in this category give the exact commands. Nothing before that point is worth acting on.' `
+                    -Confidence 'Certain'
+            } elseif ($deepBlueFindings.Count -eq 0) {
+                Add-Ok -Message 'DeepBlueCLI found nothing suspicious in the Security, System and PowerShell logs, and the logging it depends on is switched on. Attribution: sans-blue-team/DeepBlueCLI, GPL-3.0, run as a separate program.'
+            } else {
+                # Group identical messages: one spraying attempt produces many lines.
+                $grouped = @($deepBlueFindings | Group-Object | Sort-Object Count -Descending |
+                        Select-Object -First 6 | ForEach-Object { "$($_.Name) (x$($_.Count))" })
+                Add-Finding -Severity 'High' -Title 'DeepBlueCLI flagged suspicious activity in the event logs' `
+                    -Evidence (($grouped -join '; ') + $(if ($deepBlueFailures.Count -gt 0) { " Logs not read: $($deepBlueFailures -join '; ')." } else { '' })) `
+                    -Impact 'These come from DeepBlueCLI (Eric Conrad / SANS, GPL-3.0), not from this script. It reads the contents of the logs rather than their configuration: long or obfuscated command lines, encoded PowerShell, repeated failed logons, and service installations that match known attack patterns. Its detections are pattern-based, so an unusual but legitimate administration tool can match.' `
+                    -Fix ("Run it yourself for the full context, which includes the decoded command line: {0} -log security. Then match each hit against what you were doing at that time." -f $DeepBlueCliPath) `
+                    -Confidence 'Uncertain'
             }
         }
     }
@@ -8451,6 +9363,129 @@ function Test-SoftwareHealth {
             -Impact 'Without a package manager every program has to be updated by hand from its own website. In practice that means several programs stay outdated longer than they should.' `
             -Fix 'Install "App Installer" from the Microsoft Store. After that, "winget upgrade --include-unknown" shows everything with a newer version available.' `
             -Confidence 'Certain'
+    }
+
+    # Microsoft Office / Click-to-Run update state. Office updates on its own schedule,
+    # entirely separately from Windows Update, and a Click-to-Run installation with updates
+    # disabled keeps working while quietly never receiving a fix again. Office is the most
+    # attacked application surface on a Windows machine, so this matters more than the
+    # third-party programs the inventory above already covers.
+    $c2rKey = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
+    $c2rVersion = Get-RegValue -Path $c2rKey -Name 'VersionToReport'
+    if ([string]::IsNullOrWhiteSpace([string]$c2rVersion)) {
+        Add-Skip -Message 'Microsoft Office (Click-to-Run) is not installed, so its update state was not assessed.'
+    } else {
+        $c2rEnabled = Get-RegValue -Path $c2rKey -Name 'UpdatesEnabled'
+        $c2rChannel = Get-RegValue -Path $c2rKey -Name 'CDNBaseUrl'
+        $c2rLastUpdate = Get-RegValue -Path $c2rKey -Name 'LastUpdateSuccessTime'
+        $c2rEvidence = "Office version $c2rVersion"
+        if ($c2rLastUpdate) { $c2rEvidence += ", last successful update $c2rLastUpdate" }
+        if ($c2rChannel) { $c2rEvidence += ", channel $c2rChannel" }
+
+        if ([string]$c2rEnabled -match '(?i)^false$') {
+            Add-Finding -Severity 'High' -Title 'Microsoft Office updates are turned off' `
+                -Evidence ("UpdatesEnabled = False under {0}. {1}" -f $c2rKey, $c2rEvidence) `
+                -Impact 'Office does not update through Windows Update - it has its own updater, and that updater is switched off. Word and Excel documents are the most common way a machine gets attacked from the outside, and this installation will never receive another fix.' `
+                -Fix 'Open any Office application > File > Account > Update Options > Enable Updates. Or set UpdatesEnabled to True under the Click-to-Run Configuration key.' `
+                -Confidence 'Certain'
+        } else {
+            # An installation that has not updated in months is as stale as one with
+            # updates off, so judge the date rather than only the switch.
+            $c2rAgeDays = $null
+            if ($c2rLastUpdate) {
+                $c2rDate = ([string]$c2rLastUpdate) -as [datetime]
+                if ($null -ne $c2rDate) { $c2rAgeDays = [math]::Round(((Get-Date) - $c2rDate).TotalDays) }
+            }
+            if ($null -ne $c2rAgeDays -and $c2rAgeDays -gt 90) {
+                Add-Finding -Severity 'Medium' -Title 'Microsoft Office has not updated in a long time' `
+                    -Evidence ("{0} - that is {1} days ago, with updates enabled." -f $c2rEvidence, $c2rAgeDays) `
+                    -Impact 'The updater is on but has not succeeded in months. Either it cannot reach Microsoft, or something is blocking the scheduled task that drives it.' `
+                    -Fix 'Force a check: File > Account > Update Options > Update Now. If it fails, check that the "Office Automatic Updates" scheduled task exists and is enabled.' `
+                    -Confidence 'Likely'
+            } else {
+                Add-Ok -Message ("Microsoft Office updates are enabled ({0})." -f $c2rEvidence)
+            }
+        }
+    }
+
+    # Browser enterprise policy. Force-installed extensions and a policy-pinned homepage or
+    # search provider are set here, they cannot be removed from inside the browser, and they
+    # need no administrator rights when written to HKCU. Counting extensions in the profile
+    # folder - which the inventory above does - does not see them.
+    $browserPolicies = @(
+        @{ Name = 'Chrome'; Paths = @('HKLM:\SOFTWARE\Policies\Google\Chrome', 'HKCU:\SOFTWARE\Policies\Google\Chrome') }
+        @{ Name = 'Edge'; Paths = @('HKLM:\SOFTWARE\Policies\Microsoft\Edge', 'HKCU:\SOFTWARE\Policies\Microsoft\Edge') }
+        @{ Name = 'Firefox'; Paths = @('HKLM:\SOFTWARE\Policies\Mozilla\Firefox', 'HKCU:\SOFTWARE\Policies\Mozilla\Firefox') }
+    )
+    $policyHits = @()
+    foreach ($browser in $browserPolicies) {
+        foreach ($policyPath in $browser.Paths) {
+            if (-not (Test-Path -LiteralPath $policyPath)) { continue }
+            $hive = if ($policyPath -match '^HKCU') { 'HKCU' } else { 'HKLM' }
+
+            # Force-installed extensions live in a subkey of numbered values.
+            foreach ($forceKey in @("$policyPath\ExtensionInstallForcelist", "$policyPath\Extensions\Install")) {
+                if (-not (Test-Path -LiteralPath $forceKey)) { continue }
+                $forced = @((Get-Item -LiteralPath $forceKey -ErrorAction SilentlyContinue).GetValueNames() |
+                        ForEach-Object { (Get-Item -LiteralPath $forceKey).GetValue($_) })
+                if ($forced.Count -gt 0) {
+                    $policyHits += "$($browser.Name) [$hive] force-installs $($forced.Count) extension(s): $((@($forced | Select-Object -First 3) -join ', '))"
+                }
+            }
+
+            # A pinned homepage or search provider is the other half of a hijack.
+            foreach ($valueName in 'HomepageLocation', 'DefaultSearchProviderSearchURL', 'RestoreOnStartupURLs') {
+                $policyValue = Get-RegValue -Path $policyPath -Name $valueName
+                if (-not [string]::IsNullOrWhiteSpace([string]$policyValue)) {
+                    $policyHits += "$($browser.Name) [$hive] $valueName = $((@($policyValue) -join ', '))"
+                }
+            }
+        }
+    }
+    if ($policyHits.Count -gt 0) {
+        Add-Finding -Severity 'High' -Title 'Browser policy forces extensions, a homepage or a search provider' `
+            -Evidence (($policyHits | Select-Object -First 6) -join '; ') `
+            -Impact 'A policy-installed extension cannot be removed from the browser interface, and it can hold permission to read and change every page you visit - including everything you type into one. Written under HKCU it needs no administrator rights at all, which makes it a favourite for adware and for anything wanting to sit between you and your logins.' `
+            -Fix 'Inspect chrome://policy or edge://policy to see what is applied and where it comes from. If you did not set it - and no employer manages this machine - delete the key under SOFTWARE\Policies for that browser and restart it.' `
+            -Confidence 'Likely'
+    } else {
+        Add-Ok -Message 'No browser policy forces extensions, a homepage or a search provider (Chrome, Edge and Firefox checked in both HKLM and HKCU).'
+    }
+
+    # Is the browser actually being updated? Measured from the binary date, not from
+    # whether a particular updater exists. Checking for the gupdate service and the
+    # GoogleUpdate scheduled tasks was the obvious approach and it is wrong: a
+    # winget-managed or Store-managed browser has neither and is still perfectly current,
+    # so that check reports a false alarm on an increasingly common setup. A version floor
+    # is no better - it needs re-editing every few weeks. What holds regardless of how the
+    # browser is kept up to date is that the executable changes when it updates, and
+    # browsers ship every two to four weeks.
+    $browserBinaries = @(
+        @{ Name = 'Chrome'; Path = (Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe') }
+        @{ Name = 'Chrome'; Path = (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe') }
+        @{ Name = 'Edge'; Path = (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe') }
+        @{ Name = 'Firefox'; Path = (Join-Path $env:ProgramFiles 'Mozilla Firefox\firefox.exe') }
+        @{ Name = 'Brave'; Path = (Join-Path $env:ProgramFiles 'BraveSoftware\Brave-Browser\Application\brave.exe') }
+    )
+    $staleBrowsers = @()
+    $freshBrowsers = @()
+    foreach ($browserBinary in $browserBinaries) {
+        if ([string]::IsNullOrWhiteSpace($browserBinary.Path) -or -not (Test-Path -LiteralPath $browserBinary.Path)) { continue }
+        $binaryInfo = Get-Item -LiteralPath $browserBinary.Path -ErrorAction SilentlyContinue
+        if (-not $binaryInfo) { continue }
+        $binaryAge = [math]::Round(((Get-Date) - $binaryInfo.LastWriteTime).TotalDays)
+        $binaryText = "$($browserBinary.Name) $($binaryInfo.VersionInfo.ProductVersion), last changed $($binaryInfo.LastWriteTime.ToString('yyyy-MM-dd')) ($binaryAge days ago)"
+        # Two months without the executable changing means several releases were missed.
+        if ($binaryAge -gt 60) { $staleBrowsers += $binaryText } else { $freshBrowsers += $binaryText }
+    }
+    if ($staleBrowsers.Count -gt 0) {
+        Add-Finding -Severity 'High' -Title 'A browser has not been updated in months' `
+            -Evidence ($staleBrowsers -join '; ') `
+            -Impact 'Browsers ship every two to four weeks, and each release fixes vulnerabilities that become public the moment it lands. An executable unchanged for over two months means several of those releases were missed, whatever the reason - a removed updater, a blocked update server, or a browser that is simply never closed long enough to apply one.' `
+            -Fix 'Open the browser and check its own update page (chrome://settings/help, edge://settings/help, or Help > About Firefox), then restart it so the update applies. If nothing happens, reinstall the browser or update it with: winget upgrade --id <package>' `
+            -Confidence 'Likely'
+    } elseif ($freshBrowsers.Count -gt 0) {
+        Add-Ok -Message ("Every installed browser has been updated recently: {0}." -f ($freshBrowsers -join '; '))
     }
 }
 

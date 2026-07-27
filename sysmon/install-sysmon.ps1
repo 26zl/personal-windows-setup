@@ -16,18 +16,69 @@
   sysmon\sysmonconfig-export.xml, refresh $configSha256 with Get-FileHash - and
   commit it so the LF blob that GitHub serves matches the pin.
 
-  KNOW WHAT THIS CONFIG DOES NOT COLLECT. The bundled copy is source version 74
-  (2021-07-08), schemaversion 4.50. Upstream ships three rule groups commented
-  out, and this copy keeps them that way:
-    - Event 23 FileDelete       - no record of files being wiped (ransomware)
-    - Event 24 ClipboardChange  - no clipboard capture
-    - Event 25 ProcessTampering - no record of code written into a live process
-  They are off upstream because FileDelete archives deleted files and can fill a
-  disk, and ProcessTampering needs tuning plus a SIEM to correlate ProcessGuids.
-  That is a defensible default, but it is a deliberate blind spot rather than
-  full coverage. To turn one on, uncomment its RuleGroup in the XML, refresh
-  $configSha256, and reload with: sysmon -c <config.xml>
-  The health check reports which event IDs the channel is actually receiving.
+  THIS IS A FORK, NOT A COPY. The base is SwiftOnSecurity sysmon-config source
+  version 74 (2021-07-08, CC BY 4.0), which has not been updated since. What differs
+  from it, in full, so nobody has to diff 1349 lines to find out:
+
+    * schemaversion raised from 4.50 to 4.81 (see PORTABILITY below)
+    * six added rule groups in a marked block at the end of the file: ProcessTampering,
+      ImageLoad (include + exclude), FileDeleteDetected (include + exclude), and a
+      RegistryEvent include for SilentProcessExit - 149 lines in total
+    * 23 include-rule paths rewritten from absolute C:\ to drive-relative
+
+  Everything else is upstream, untouched. Upstream leaves events 23, 24 and 25
+  commented out; this fork makes a different call on two of them:
+    - Event 25 ProcessTampering    ON. Process hollowing and herpaderping have no
+      benign explanation on a personal machine, and the event is rare.
+    - Event 26 FileDeleteDetected  ON, scoped to executables, scripts, .evtx and
+      shadow copies. Records that a file was deleted without keeping a copy of it.
+      One exclusion is not optional: Windows writes and deletes a
+      __PSScriptPolicyTest_*.ps1 file every time PowerShell evaluates an execution
+      policy. Measured at 4.5 per minute on an ordinary desktop, that is roughly
+      45,000 events a week of Windows checking itself, in a channel with a size cap.
+    - Event 23 FileDelete          OFF. It archives every deleted file to disk and
+      fills a drive quietly. Event 26 covers the same ground without that.
+    - Event 24 ClipboardChange     OFF. It captures clipboard CONTENT, so passwords
+      and one-time codes would end up in an event log.
+    - Event 7 ImageLoad            ON, narrowly. Upstream ships this as an empty
+      include group, which matches nothing - so event 7 never fires at all and DLL
+      side-loading is invisible. Unfiltered it is the highest-volume event Sysmon
+      produces, so this copy includes only DLLs loading from user-writable
+      directories and then excludes the package managers, editors and runtimes that
+      legitimately live there.
+
+  Not switched to olafhartong/sysmon-modular, and the reason is measured rather
+  than assumed: it carries 246 RegistryEvent include rules against this file's
+  114, and skews to "begin with" and "contains" where this one uses "end with".
+  On a machine already dropping RegistryEvent under load - the common case, and
+  the reason event 255 QUEUE exists - that is the wrong direction. sysmon-modular
+  is the better base for anyone who wants to tune per module; it is not a drop-in
+  improvement for a config that is flooding.
+
+  PORTABILITY, HONESTLY. Three things are worth knowing before deploying this on a
+  machine that is not the one it was tuned on:
+    - REQUIRES SYSMON 14 OR LATER. The file declares schemaversion 4.81 because it
+      uses FileDeleteDetected. A modern Sysmon also accepts the older 4.50 this file
+      used to declare, but then an older Sysmon would apply the config while silently
+      dropping that rule group - a gap that looks like a working install. Declaring
+      the schema the features actually need turns that into a clear refusal instead.
+    - WORKS WITH WINDOWS ON ANY DRIVE, for detection. Upstream hardcodes C:\ in 176
+      places. 23 of those were in include rules, which is where it matters: on a
+      machine with Windows on D: they would match nothing and the detection would be
+      silently gone. Those 23 are now drive-relative, as are all the local additions.
+      The remaining 153 are in exclude rules, where failing to match costs noise
+      rather than coverage, and they are left as upstream wrote them - rewriting all
+      of them would be a divergence to maintain forever for no gain in detection.
+    - The ImageLoad exclusions are the software the author had installed. That list
+      cannot be complete. A burst of event 7 after deploying this means something you
+      run lives in a user-writable directory and belongs in the exclude list - it is
+      tuning, not a detection. Everything else here is conservative enough to deploy
+      unchanged.
+
+  If you replace or edit the XML, refresh $configSha256 with Get-FileHash and
+  reload with: sysmon -c <config.xml>. The health check reports which event IDs
+  the channel is actually receiving, so a config collecting less than you think
+  shows up as a finding.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -42,11 +93,20 @@ if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole(
     return
 }
 
-$configSha256 = 'AF4C914DAC315FD36288A8CE3C346490D8F737AAAA87E83EA96DFF893AC6E053'
+$configSha256 = 'CE2B5FDBB9BF7A0BD39ADA966DE666D9CE7498DC71C93F2B177E31E6EA75033B'
 $configUrl    = 'https://github.com/26zl/personal-windows-setup/raw/main/sysmon/sysmonconfig-export.xml'
-$stagedConfig = 'C:\ProgramData\Sysmon\sysmonconfig-export.xml'
+# $env:ProgramData, not a literal C:\ProgramData - Windows is not always on C:, and a
+# hardcoded drive here would have the script write the config somewhere that does not
+# exist and then fail on a machine that is otherwise fine.
+$stagedConfig = Join-Path $env:ProgramData 'Sysmon\sysmonconfig-export.xml'
 $logChannel   = 'Microsoft-Windows-Sysmon/Operational'
-$logMaxBytes  = 512MB
+# 1 GB, not the 512 MB this used to be. Measured on an ordinary desktop running this
+# configuration: roughly 150 MB a day, so 512 MB is about three days of history and 1 GB
+# is about a week. Neither is the 30 days incident response actually wants - that would
+# need 4-5 GB - but a week is the difference between "I noticed something on Monday and
+# can still see Friday" and not. Raise it further with:
+#   wevtutil sl Microsoft-Windows-Sysmon/Operational /ms:4294967296
+$logMaxBytes  = 1GB
 
 try {
 

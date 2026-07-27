@@ -10,7 +10,8 @@ Include the affected script, the version you ran (commit SHA if you have it), an
 
 Anything that lets these scripts do something the documentation says they will not:
 
-- The **health check** claims to be read-only. Any path where it writes to the system is in scope, including the external tools it shells out to.
+- The **health check** claims to be read-only. Any path where it writes to the system is in scope, including the external tools it shells out to. There is exactly one documented exception, and it only exists when you ask for it: `-PrivescCheckPath` makes PrivescCheck write a CSV report to a uniquely named temporary file, which is deleted when the run ends. A leftover file, a write outside that path, or a `Start-Process`/`Remove-Item` reachable without passing one of the delegation parameters is a finding — the contract tests pin both to the delegation code specifically so that stays true.
+- **Delegation to third-party tools** (`-DeepBlueCliPath`, `-PrivescCheckPath`) runs code this project did not write and does not ship. A way to make the script invoke something other than the path the user passed — argument injection through the path, an unquoted expansion, a search-order hijack on the interpreter — is in scope. Bugs in DeepBlueCLI or PrivescCheck themselves are not; report those upstream.
 - The **hardening pass** claims to change nothing until you answer `y`. Any change applied without that answer is in scope.
 - Weaknesses in the supply-chain controls: a way past the pinned SHA-256 and Authenticode checks on `office/OfficeSetup.exe`, `ConfigureDefender.exe` or `sysmon/sysmonconfig-export.xml`, or a way to make the scripts fetch something other than what the pins cover.
 - Command injection, privilege escalation, or unsafe handling of paths and registry values in any of the scripts.
