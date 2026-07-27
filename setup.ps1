@@ -228,18 +228,19 @@ if ($nvidiaGpu.Count -gt 0) {
 # The drive comes from $env:SystemDrive rather than a literal C: - the default is C:\msys64 on
 # almost every machine, but not on one where Windows lives elsewhere.
 $msys2Root = Join-Path "$env:SystemDrive\" 'msys64'
-Write-Host "==> MSYS2.MSYS2" -ForegroundColor Cyan
 if (Test-Path (Join-Path $msys2Root 'usr\bin\bash.exe')) {
+    Write-Host "==> MSYS2.MSYS2" -ForegroundColor Cyan
     Write-Host "    already installed (skipped; $msys2Root present)" -ForegroundColor DarkGray
     Write-Event 'SKIP' "MSYS2.MSYS2 already installed ($msys2Root)"
 } else {
     Install-App 'MSYS2.MSYS2'
 }
 
-# Tor Browser
-Write-Host "==> TorProject.TorBrowser" -ForegroundColor Cyan
+# Tor Browser. The header only goes here in the "already installed" branch - Install-App
+# prints its own, so announcing it up front duplicates the line on every real install.
 $torExe = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Tor Browser\Browser\firefox.exe'
 if (Test-Path $torExe) {
+    Write-Host "==> TorProject.TorBrowser" -ForegroundColor Cyan
     Write-Host "    already installed (skipped reinstall)" -ForegroundColor DarkGray
     Write-Event 'SKIP' 'TorProject.TorBrowser already installed'
 } else {
@@ -666,7 +667,9 @@ try {
     $scanState = [string](Repair-WindowsImage -Online -ScanHealth -ErrorAction Stop).ImageHealthState
 }
 catch {
-    Write-Host "    Repair-WindowsImage unavailable here ($($_.Exception.Message))" -ForegroundColor DarkGray
+    # Trim the message: the DISM error arrives with a trailing newline, which otherwise
+    # closes the parenthesis on its own line.
+    Write-Host "    Repair-WindowsImage unavailable here ($(($_.Exception.Message -replace '\s+', ' ').Trim()))" -ForegroundColor DarkGray
     $winPs = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (Test-Path $winPs) {
         Write-Host "    retrying through Windows PowerShell" -ForegroundColor DarkGray
