@@ -2933,7 +2933,14 @@ function Test-PerformanceHealth {
     if ($Fast) {
         Add-Skip -Message 'Boot measurements from the event log were skipped because -Fast is set.'
     } elseif (-not $diagLogUsable) {
-        Add-Skip -Message ('The log {0} is missing, disabled or empty, so the boot measurements Windows records itself could not be read (common in virtual machines and right after installation).' -f $diagLog)
+        # Without admin this channel is unreadable, and Get-WinEvent -ListLog then returns
+        # nothing - which looks identical to the log being absent. Naming the wrong cause
+        # sends the reader looking for a missing log that is actually there and populated.
+        if (-not $script:Ctx.IsAdmin) {
+            Add-Skip -Message ('The log {0} needs administrator rights to read, so the boot measurements Windows records itself were not assessed.' -f $diagLog)
+        } else {
+            Add-Skip -Message ('The log {0} is missing, disabled or empty, so the boot measurements Windows records itself could not be read (common in virtual machines and right after installation).' -f $diagLog)
+        }
     } else {
         $bootEvents = @()
         try {
@@ -3505,7 +3512,11 @@ function Test-PerformanceHealth {
                     -Fix 'Task Scheduler (taskschd.msc) if you want to clean up. No rush.' `
                     -Confidence 'Likely'
             } else {
-                Add-Ok -Message ('Third-party scheduled tasks are within range: {0}' -f $taskEvidence)
+                # Get-ScheduledTask only returns tasks the caller may read, so an unelevated
+                # run sees a subset - here 14 of 24. Reporting that count as a clean bill of
+                # health without saying it is partial overstates what was actually checked.
+                $taskScope = if ($script:Ctx.IsAdmin) { '' } else { ' (counted without administrator rights, so tasks owned by other users or by SYSTEM are not included)' }
+                Add-Ok -Message ('Third-party scheduled tasks are within range: {0}{1}' -f $taskEvidence, $taskScope)
             }
         }
     }
@@ -4545,36 +4556,53 @@ function Test-NetworkHealth {
     }
 
     # NetBIOS, LLMNR and mDNS
+    # Read NetBT's own registry, not Win32_NetworkAdapterConfiguration. That WMI class only
+    # lists adapters with IPEnabled=True and leaves out the Hyper-V and WSL virtual switch
+    # host adapters entirely - so a machine running WSL2 could be told "NetBIOS is disabled
+    # on every active network adapter" while NetBIOS sat listening on port 139 on
+    # vEthernet (Default Switch), which is exactly where NetbiosOptions is left at the
+    # DHCP default. The NetBT interface keys cover every interface that has a binding.
     $nbtEnabled = @()
     $nbtChecked = $false
+    $nbtRoot = 'HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces'
     try {
-        $adapterConfigs = @(Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' -ErrorAction Stop)
-        if ($adapterConfigs.Count -gt 0) {
+        $nbtKeys = @(Get-ChildItem -LiteralPath $nbtRoot -ErrorAction Stop)
+        if ($nbtKeys.Count -gt 0) {
             $nbtChecked = $true
-            foreach ($cfg in $adapterConfigs) {
-                # 0 = follow DHCP (in practice on), 1 = on, 2 = off.
-                if ($null -eq $cfg.TcpipNetbiosOptions -or [int]$cfg.TcpipNetbiosOptions -ne 2) {
-                    $value = 'unknown'
-                    if ($null -ne $cfg.TcpipNetbiosOptions) { $value = "$($cfg.TcpipNetbiosOptions)" }
-                    $nbtEnabled += "$($cfg.Description) (TcpipNetbiosOptions=$value)"
+            # Map interface GUID -> friendly name so the evidence names something recognisable.
+            $adapterNames = @{}
+            try {
+                foreach ($adapter in @(Get-NetAdapter -ErrorAction Stop)) {
+                    if ($adapter.InterfaceGuid) { $adapterNames[[string]$adapter.InterfaceGuid] = $adapter.Name }
                 }
+            } catch {
+                Write-Verbose -Message ("Get-NetAdapter unavailable, GUIDs will be shown instead: {0}" -f $_.Exception.Message)
+            }
+            foreach ($nbtKey in $nbtKeys) {
+                $option = Get-RegValue -Path $nbtKey.PSPath -Name 'NetbiosOptions'
+                # 0 = follow DHCP (in practice on), 1 = on, 2 = off.
+                if ($null -ne $option -and [int]$option -eq 2) { continue }
+                $guid = $nbtKey.PSChildName -replace '^Tcpip_', ''
+                $label = if ($adapterNames.ContainsKey($guid)) { $adapterNames[$guid] } else { $guid }
+                $value = if ($null -eq $option) { 'not set' } else { "$option" }
+                $nbtEnabled += "$label (NetbiosOptions=$value)"
             }
         }
     } catch {
-        # The WMI class is absent from some minimal images.
+        # The key is absent on some minimal images.
         $nbtChecked = $false
     }
 
     if (-not $nbtChecked) {
-        Add-Skip -Message 'Could not read Win32_NetworkAdapterConfiguration - skipping the NetBIOS over TCP/IP check.'
+        Add-Skip -Message ("Could not read {0} - skipping the NetBIOS over TCP/IP check." -f $nbtRoot)
     } elseif ($nbtEnabled.Count -gt 0) {
         Add-Finding -Severity 'Low' -Title 'NetBIOS over TCP/IP is not turned off' `
             -Evidence ((@($nbtEnabled | Select-Object -First 6) -join '; ')) `
             -Impact 'When a DNS lookup fails, the machine broadcasts the name it is after on the local network (NBT-NS). Anyone on the same network can answer "that is me" and get the machine to send its NTLM logon there - the basis for tools like Responder.' `
-            -Fix 'Per adapter: Network Connections > Properties > Internet Protocol Version 4 > Advanced > WINS > "Disable NetBIOS over TCP/IP".' `
+            -Fix 'Per adapter: Network Connections > Properties > Internet Protocol Version 4 > Advanced > WINS > "Disable NetBIOS over TCP/IP". Virtual switch adapters (Hyper-V, WSL) do not appear there - set NetbiosOptions to 2 directly under HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces\Tcpip_<GUID>. Check afterwards with: Get-NetTCPConnection -LocalPort 139 -State Listen' `
             -Confidence 'Certain'
     } else {
-        Add-Ok -Message 'NetBIOS over TCP/IP is disabled on every active network adapter.'
+        Add-Ok -Message ("NetBIOS over TCP/IP is disabled on all {0} interfaces registered with NetBT, including virtual switch adapters." -f $nbtKeys.Count)
     }
 
     $llmnr = Get-RegValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' -Name 'EnableMulticast'
