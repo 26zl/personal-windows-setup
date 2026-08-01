@@ -92,9 +92,14 @@ catch { Write-Host "  Defender is not managing this machine - ASR and exclusion 
 $asrState   = if ($mp) { Get-AsrState } else { @{} }
 $asrPending = @($asrTargets.Keys | Where-Object { $asrState[$_] -ne 1 })
 
-$exclPath    = @($mp.ExclusionPath      | Where-Object { $_ })
-$exclProcess = @($mp.ExclusionProcess   | Where-Object { $_ })
-$exclExt     = @($mp.ExclusionExtension | Where-Object { $_ })
+# Guarded on $mp so a session with Set-StrictMode does not throw when Defender
+# is not answering (the script is run with iex inside arbitrary user sessions).
+$exclPath = @(); $exclProcess = @(); $exclExt = @()
+if ($mp) {
+    $exclPath    = @($mp.ExclusionPath      | Where-Object { $_ })
+    $exclProcess = @($mp.ExclusionProcess   | Where-Object { $_ })
+    $exclExt     = @($mp.ExclusionExtension | Where-Object { $_ })
+}
 $exclTotal   = $exclPath.Count + $exclProcess.Count + $exclExt.Count
 
 $nbIfaces = @(Get-ChildItem $netbtKey -ErrorAction SilentlyContinue)
@@ -117,7 +122,7 @@ if ($mp) {
 }
 Write-Host ("  NetBIOS over TCP/IP            : {0}" -f $(if ($nbOn.Count -eq 0) { 'disabled on every interface (good)' } else { "still on/DHCP-controlled on $($nbOn.Count) of $($nbIfaces.Count)" })) -ForegroundColor Gray
 Write-Host ("  AutoPlay / AutoRun             : {0}" -f $(if ($autoRunOff) { 'disabled by policy (good)' } else { 'not policy-disabled' })) -ForegroundColor Gray
-Write-Host ("  NTLM level                     : {0}" -f $(if ($lmLevel -ge 5) { "$lmLevel (NTLMv2 only, good)" } elseif ($null -eq $lmLevel) { 'not set (Windows default still offers LM/NTLMv1)' } else { "$lmLevel (LM/NTLMv1 still offered)" })) -ForegroundColor Gray
+Write-Host ("  NTLM level                     : {0}" -f $(if ($lmLevel -ge 5) { "$lmLevel (NTLMv2 only, good)" } elseif ($null -eq $lmLevel) { 'not set (client sends NTLMv2 only, but LM/NTLMv1 from others is still accepted)' } else { "$lmLevel (below 5, LM/NTLMv1 still allowed)" })) -ForegroundColor Gray
 Write-Host ("  Admin shares (C`$, ADMIN`$)      : {0}" -f $(if ($sharesOff) { 'off (good)' } elseif ($adminShares) { "on - $(($adminShares.Name) -join ', ')" } else { 'on' })) -ForegroundColor Gray
 
 # --- changes, each its own y/n ----------------------------------------------------------
@@ -156,8 +161,18 @@ if ($mp -and $exclTotal -gt 0) {
             if ($exclPath)    { Remove-MpPreference -ExclusionPath $exclPath -ErrorAction Stop }
             if ($exclProcess) { Remove-MpPreference -ExclusionProcess $exclProcess -ErrorAction Stop }
             if ($exclExt)     { Remove-MpPreference -ExclusionExtension $exclExt -ErrorAction Stop }
-            Write-Host "    exclusions cleared" -ForegroundColor DarkGray
-            $applied++
+            # Confirm against Defender, like the ASR block does - a policy-managed
+            # exclusion can survive a Remove-MpPreference that did not throw.
+            $post = Get-MpPreference
+            $stillThere = @($post.ExclusionPath | Where-Object { $_ }).Count +
+                          @($post.ExclusionProcess | Where-Object { $_ }).Count +
+                          @($post.ExclusionExtension | Where-Object { $_ }).Count
+            if ($stillThere -eq 0) {
+                Write-Host "    exclusions cleared" -ForegroundColor DarkGray
+                $applied++
+            } else {
+                Write-Host "    $stillThere exclusion(s) still present (set by policy?)" -ForegroundColor Yellow
+            }
         } catch {
             Write-Host "    could not clear exclusions (set by policy?): $($_.Exception.Message)" -ForegroundColor Yellow
         }
@@ -185,7 +200,9 @@ if (-not $autoRunOff) {
     Write-Host "  Blocks USB sticks and disks from auto-starting anything when plugged in." -ForegroundColor DarkGray
     if (Confirm-Change "Disable AutoPlay/AutoRun on all drive types?") {
         try {
-            $null = New-Item $explorerKey -Force
+            # New-Item -Force on an EXISTING registry key recreates it and deletes
+            # every value in it, so only create the key when it is actually missing.
+            if (-not (Test-Path $explorerKey)) { $null = New-Item $explorerKey -Force }
             Set-ItemProperty $explorerKey -Name NoDriveTypeAutoRun -Value 255 -Type DWord -ErrorAction Stop
             Set-ItemProperty $explorerKey -Name NoAutorun -Value 1 -Type DWord -ErrorAction Stop
             Write-Host "    AutoPlay/AutoRun disabled by policy" -ForegroundColor DarkGray

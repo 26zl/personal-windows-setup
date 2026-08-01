@@ -2829,10 +2829,32 @@ function Test-StorageHealth {
         # data anywhere in this block.
         $autochkHasSwitch = ($bootExecuteText.IndexOf('autochk /', [StringComparison]::OrdinalIgnoreCase) -ge 0)
 
+        # Win32_Volume answers the same question language-neutrally (DirtyBitSet), but
+        # only to an elevated caller - unelevated the property comes back empty. Query
+        # it once up front and prefer it; the fsutil text below stays as the fallback.
+        $volumeDirtyByLetter = @{}
+        try {
+            foreach ($wmiVolume in @(Get-CimInstance Win32_Volume -Filter 'DriveType=3' -ErrorAction Stop)) {
+                if ($wmiVolume.DriveLetter -and $null -ne $wmiVolume.DirtyBitSet) {
+                    $volumeDirtyByLetter[[string]$wmiVolume.DriveLetter] = [bool]$wmiVolume.DirtyBitSet
+                }
+            }
+        } catch {
+            Write-Verbose -Message ("Win32_Volume could not be read: {0}" -f $_.Exception.Message)
+        }
+
         foreach ($volumeLetter in @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DeviceID)) {
             if ($autochkHasSwitch -and $bootExecuteText.IndexOf($volumeLetter, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
                 $dirtyAssessed += $volumeLetter
                 $dirtyVolumes += "$volumeLetter (BootExecute is '$bootExecuteText' - a repair pass is queued for the next boot)"
+                continue
+            }
+
+            if ($volumeDirtyByLetter.ContainsKey($volumeLetter)) {
+                $dirtyAssessed += $volumeLetter
+                if ($volumeDirtyByLetter[$volumeLetter]) {
+                    $dirtyVolumes += "$volumeLetter (Win32_Volume reports the dirty bit set)"
+                }
                 continue
             }
 
@@ -2850,10 +2872,17 @@ function Test-StorageHealth {
                 $dirtyUnreadable += $volumeLetter
                 continue
             }
-            $dirtyAssessed += $volumeLetter
-            # Only the clean answer carries a negation, in every language.
-            if ($dirtyRaw -notmatch '(?i)\bnot\b') {
+            # Fallback for machines without a readable Win32_Volume, English UI only:
+            # fsutil's output is MUI-localized ("not" is "ikke", "nicht", ... elsewhere),
+            # so only an answer visibly carrying the English words is judged - anything
+            # else lands in the not-assessed bucket instead of becoming a false alarm.
+            if ($dirtyRaw -match '(?i)\bnot\b') {
+                $dirtyAssessed += $volumeLetter
+            } elseif ($dirtyRaw -match '(?i)\bdirty\b') {
+                $dirtyAssessed += $volumeLetter
                 $dirtyVolumes += "$volumeLetter (fsutil reports the volume dirty)"
+            } else {
+                $dirtyUnreadable += $volumeLetter
             }
         }
 
@@ -2866,7 +2895,7 @@ function Test-StorageHealth {
         } elseif ($dirtyAssessed.Count -eq 0) {
             Add-Skip -Message ("The NTFS dirty bit was not checked on any volume - fsutil needs administrator rights for the system volume, and BootExecute shows no queued repair. Not read: {0}." -f (($dirtyUnreadable -join ', ')))
         } elseif ($dirtyUnreadable.Count -gt 0) {
-            Add-Skip -Message ("No queued repair on {0}, but {1} could not be read without administrator rights - so the dirty bit is only partly assessed." -f (($dirtyAssessed -join ', ')), (($dirtyUnreadable -join ', ')))
+            Add-Skip -Message ("No queued repair on {0}, but {1} could not be read (fsutil needs administrator, or answered in a language the tool does not parse) - so the dirty bit is only partly assessed." -f (($dirtyAssessed -join ', ')), (($dirtyUnreadable -join ', ')))
         } else {
             Add-Ok -Message ("No repair is queued and none of the fixed volumes is marked dirty ({0})." -f (($dirtyAssessed -join ', ')))
         }
@@ -4120,6 +4149,25 @@ function Test-PowerHealth {
             }
             if ($designCap -and $fullCap) { $capSource = 'root\WMI: BatteryStaticData + BatteryFullChargedCapacity' }
         }
+        # Some firmwares (Lenovo among them) fail BatteryStaticData yet fill the SMBIOS
+        # battery table, which Win32_PortableBattery exposes. DesignCapacity there is
+        # documented as mWh as well, so it pairs with BatteryFullChargedCapacity.
+        if (-not $capSource -and $fullCap) {
+            try {
+                $pbat = @(Get-CimInstance -ClassName Win32_PortableBattery -ErrorAction Stop)
+                if ($pbat.Count -gt 0 -and $pbat[0].DesignCapacity -and [double]$pbat[0].DesignCapacity -gt 0) {
+                    $pbDesign = [double]$pbat[0].DesignCapacity
+                    # A full/design ratio far outside a plausible wear window means the
+                    # firmware used other units (mAh) - keep the skip in that case.
+                    if (($fullCap / $pbDesign) -ge 0.2 -and ($fullCap / $pbDesign) -le 1.2) {
+                        $designCap = $pbDesign
+                        $capSource = 'Win32_PortableBattery (design) + root\WMI BatteryFullChargedCapacity (full charge)'
+                    }
+                }
+            } catch {
+                Write-Verbose -Message "Win32_PortableBattery unavailable: $($_.Exception.Message)"
+            }
+        }
 
         $reportHint = 'You get the full wear report with powercfg /batteryreport /output %USERPROFILE%\battery-report.html - it writes a file to disk, so this tool does not run it for you.'
         if ($capSource -and $designCap -gt 0) {
@@ -4134,7 +4182,7 @@ function Test-PowerHealth {
                 Add-Ok -Message "The battery has $healthPct % of its design capacity left ($wearPct % wear)."
             }
         } else {
-            Add-Skip -Message "Battery wear could not be calculated - neither Win32_Battery nor root\WMI reported both design and full charge capacity. $reportHint"
+            Add-Skip -Message "Battery wear could not be calculated - none of Win32_Battery, root\WMI (BatteryStaticData) or Win32_PortableBattery delivered a usable design plus full charge capacity pair. $reportHint"
         }
 
         try {
@@ -4351,7 +4399,7 @@ function Test-PowerHealth {
             $memDiag = @(Get-WinEvent -FilterHashtable @{
                     LogName = 'System'
                     ProviderName = 'Microsoft-Windows-MemoryDiagnostics-Results'
-                    Id = 1101, 1201
+                    Id = 1101, 1102
                 } -MaxEvents 5 -ErrorAction Stop)
         } catch {
             Write-Verbose -Message ("No memory diagnostic results found: {0}" -f $_.Exception.Message)
@@ -4362,8 +4410,10 @@ function Test-PowerHealth {
             $latest = $memDiag[0]
             $resultText = (([string]$latest.Message) -replace '\s+', ' ').Trim()
             if ($resultText.Length -gt 200) { $resultText = $resultText.Substring(0, 200) }
-            # Event 1201 is the detailed result; hardware problems are reported there.
-            if ([int]$latest.Id -eq 1201 -or $resultText -match '(?i)error|problem|fail') {
+            # Judged by event id alone: 1101 is the clean result, 1102 the failed one.
+            # The message text is localized, and even the clean English text ("detected
+            # no errors") contains the word "error", so word-matching misreads a pass.
+            if ([int]$latest.Id -eq 1102) {
                 Add-Finding -Severity 'High' -Title 'The Windows memory diagnostic reported a problem' `
                     -Evidence ("Event {0} on {1}: {2}" -f $latest.Id, $latest.TimeCreated, $resultText) `
                     -Impact 'A memory module that fails a test causes crashes, file corruption and blue screens that look like unrelated software faults.' `
@@ -5322,8 +5372,13 @@ function Test-NetworkHealth {
             $wlanNames = @([regex]::Matches($wlanProfilesRaw, '(?m)^\s*\S[^:\r\n]*:\s*(\S.*?)\s*$') |
                     ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -notmatch '^\s*$' } | Select-Object -Unique)
             $weakProfiles = @()
+            $namedProfiles = @()
             foreach ($wlanName in $wlanNames) {
                 $detail = & netsh wlan show profile name="$wlanName" key=clear 2>&1 | Out-String
+                # The loose line parse above can pick up non-profile lines; netsh itself
+                # knows which names are real and exits non-zero for the rest.
+                if ($LASTEXITCODE -ne 0) { continue }
+                $namedProfiles += $wlanName
                 # Authentication and cipher values are protocol names, not translated.
                 if ($detail -match '(?i)\b(WEP|TKIP)\b') { $weakProfiles += "$wlanName (WEP or TKIP)" }
                 elseif ($detail -match '(?i)\bOpen\b' -and $detail -notmatch '(?i)\b(WPA|OWE)') { $weakProfiles += "$wlanName (open, no encryption)" }
@@ -5334,8 +5389,8 @@ function Test-NetworkHealth {
                     -Impact 'The machine reconnects to a saved network automatically whenever it hears the name. An open or WEP profile means anyone can stand up an access point with that name and have this machine join it, and then read or alter the traffic. Old hotel and airport profiles are the usual culprits.' `
                     -Fix 'Settings > Network & internet > Wi-Fi > Manage known networks - forget the ones you do not need. From PowerShell: netsh wlan delete profile name="<name>"' `
                     -Confidence 'Likely'
-            } elseif ($wlanNames.Count -gt 0) {
-                Add-Ok -Message ("All {0} saved wireless profile(s) use modern encryption - none is open, WEP or TKIP." -f $wlanNames.Count)
+            } elseif ($namedProfiles.Count -gt 0) {
+                Add-Ok -Message ("All {0} saved wireless profile(s) use modern encryption - none is open, WEP or TKIP." -f $namedProfiles.Count)
             }
         } catch {
             Add-Skip -Message 'Saved wireless profiles could not be read.'
@@ -5674,14 +5729,21 @@ function Test-SecurityHealth {
             Add-Ok -Message 'Network Protection blocks malicious domains.'
         }
 
-        if ([int]$mpPref.EnableControlledFolderAccess -eq 0) {
+        $cfaValue = [int]$mpPref.EnableControlledFolderAccess
+        if ($cfaValue -eq 0) {
             Add-Finding -Severity Low -Title 'Controlled folder access (ransomware protection) is off' `
                 -Evidence 'Get-MpPreference -> EnableControlledFolderAccess = 0' `
                 -Impact 'Unknown programs can write freely in Documents, Pictures and other user folders - which is exactly what ransomware does.' `
                 -Fix 'Windows Security -> Virus & threat protection -> Ransomware protection -> Controlled folder access. Note that it may require you to allow your own programs.' `
                 -Confidence Likely
+        } elseif ($cfaValue -eq 2 -or $cfaValue -eq 4) {
+            Add-Finding -Severity Low -Title 'Controlled folder access is in audit mode and blocks nothing' `
+                -Evidence ("Get-MpPreference -> EnableControlledFolderAccess = {0} (audit)" -f $cfaValue) `
+                -Impact 'Writes to the protected folders are only logged, never stopped - ransomware runs exactly as it would with the feature off.' `
+                -Fix "Set-MpPreference -EnableControlledFolderAccess Enabled" `
+                -Confidence Certain
         } else {
-            Add-Ok -Message 'Controlled folder access is active against ransomware.'
+            Add-Ok -Message ("Controlled folder access is active against ransomware (EnableControlledFolderAccess = {0})." -f $cfaValue)
         }
 
         # Defender exclusions. Without admin, Get-MpPreference returns the literal string
@@ -6267,15 +6329,17 @@ function Test-SecurityHealth {
 
     $lmLevel = Get-RegValue -Path $lsaPath -Name 'LmCompatibilityLevel'
     if ($null -eq $lmLevel) {
-        Add-Ok -Message 'The NTLM level is at the Windows default (LmCompatibilityLevel is not overridden) - only NTLMv2 is sent.'
+        Add-Ok -Message 'The NTLM level is at the Windows default (LmCompatibilityLevel is not overridden) - only NTLMv2 is sent, though LM/NTLMv1 responses from other machines are still accepted (LmCompatibilityLevel = 5 refuses them).'
     } elseif ([int]$lmLevel -lt 3) {
         Add-Finding -Severity High -Title 'The NTLM level allows the old, weak LM/NTLMv1 protocols' `
             -Evidence ("{0}\LmCompatibilityLevel = {1} (3 or higher is required for NTLMv2 only)" -f $lsaPath, $lmLevel) `
             -Impact 'LM and NTLMv1 responses can be cracked back to the password in minutes, and make relay attacks against the machine far easier.' `
             -Fix 'Local Security Policy (secpol.msc) -> Security Options -> "Network security: LAN Manager authentication level" -> "Send NTLMv2 response only".' `
             -Confidence Certain
+    } elseif ([int]$lmLevel -ge 5) {
+        Add-Ok -Message ("The NTLM level is set to {0} - only NTLMv2 is sent, and LM/NTLMv1 responses from other machines are refused." -f $lmLevel)
     } else {
-        Add-Ok -Message ("The NTLM level is set to {0} - only NTLMv2 is sent." -f $lmLevel)
+        Add-Ok -Message ("The NTLM level is set to {0} - only NTLMv2 is sent, though LM/NTLMv1 responses from other machines are still accepted (level 5 refuses them)." -f $lmLevel)
     }
 
     $smbServerSigning = $null
@@ -8370,7 +8434,11 @@ function Test-LoggingHealth {
     # command line in process events
     $cmdLinePath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit'
     $cmdLineFlag = Get-PolicyFlag -Path $cmdLinePath -Name 'ProcessCreationIncludeCmdLine_Enabled'
-    if ($cmdLineFlag -eq 1) {
+    if ($cmdLineFlag -eq 1 -and $processCreationState -eq 'Off') {
+        # The flag alone is not an OK - with the subcategory off no 4688 event is
+        # written at all, so there is nothing for the command line to appear in.
+        Add-Skip -Message 'ProcessCreationIncludeCmdLine_Enabled = 1, but Process Creation auditing is off, so no 4688 events are written for the command line to appear in. Covered by the Process Creation finding above.'
+    } elseif ($cmdLineFlag -eq 1) {
         Add-Ok -Message 'Process events (4688) contain the full command line - ProcessCreationIncludeCmdLine_Enabled = 1.'
     } elseif ($processCreationState -eq 'On') {
         # Only a finding when 4688 is actually being written; otherwise it is noise on noise.
@@ -9503,8 +9571,10 @@ function Test-SoftwareHealth {
     # browsers ship every two to four weeks.
     $browserBinaries = @(
         @{ Name = 'Chrome'; Path = (Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe') }
-        @{ Name = 'Chrome'; Path = (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe') }
-        @{ Name = 'Edge'; Path = (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe') }
+        # String interpolation, not Join-Path: ProgramFiles(x86) does not exist on
+        # 32-bit Windows, and Join-Path throws on a null -Path.
+        @{ Name = 'Chrome'; Path = "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe" }
+        @{ Name = 'Edge'; Path = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe" }
         @{ Name = 'Firefox'; Path = (Join-Path $env:ProgramFiles 'Mozilla Firefox\firefox.exe') }
         @{ Name = 'Brave'; Path = (Join-Path $env:ProgramFiles 'BraveSoftware\Brave-Browser\Application\brave.exe') }
     )
