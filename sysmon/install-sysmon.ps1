@@ -93,7 +93,7 @@ if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole(
     return
 }
 
-$configSha256 = 'CE2B5FDBB9BF7A0BD39ADA966DE666D9CE7498DC71C93F2B177E31E6EA75033B'
+$configSha256 = '8CC734ACBB607789ED957468CA5F20E9EC19DC47A05A37CBBD30EB5C84061DB2'
 $configUrl    = 'https://github.com/26zl/personal-windows-setup/raw/main/sysmon/sysmonconfig-export.xml'
 # $env:ProgramData, not a literal C:\ProgramData - Windows is not always on C:, and a
 # hardcoded drive here would have the script write the config somewhere that does not
