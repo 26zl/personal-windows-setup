@@ -1211,6 +1211,13 @@
 		paths remaining in exclude rules are upstream's and are left alone - an
 		exclude that fails to match costs noise, not coverage.
 
+		4.81 and not the newest schema the installed Sysmon reports: the version
+		here is a floor every machine that loads this file must clear, and none
+		of the rules below use a field newer than 4.81. Raising it buys nothing
+		and makes the config refuse to load on an older Sysmon. Sysmon logging
+		"Loading configuration file with schema version 4.81" against a higher
+		binary schema version is the expected result, not a mismatch.
+
 		Upstream leaves events 23, 24 and 25 commented out. Two of those defaults
 		are worth keeping and one is not:
 

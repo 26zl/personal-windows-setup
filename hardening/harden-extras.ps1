@@ -11,6 +11,7 @@
                             -AttackSurfaceReductionRules_Actions Disabled, or put the id
                             back under ...\Windows Defender Exploit Guard\ASR\Rules
     Defender exclusions     Add-MpPreference -ExclusionPath '<path>'
+    Quarantine retention    Set-MpPreference -QuarantinePurgeItemsAfterDelay <days>
     NetBIOS over TCP/IP     NetbiosOptions = 0 under NetBT\Parameters\Interfaces\*
     AutoPlay / AutoRun      remove NoDriveTypeAutoRun + NoAutorun under Policies\Explorer
     NTLMv2 only             remove LmCompatibilityLevel under Control\Lsa
@@ -18,6 +19,11 @@
 
   Re-run this after Harden System Security: it manages some ASR rules through policy and
   can put them back.
+
+  Run this AFTER setup.ps1, not before. setup.ps1 offers this pass at the end of its run for
+  a reason: ASR rules block installers midway without a useful error. Running it first killed
+  the MSYS2 installer partway through its post-install step, leaving a tree on disk that
+  looked complete and a winget exit code that pointed nowhere near the real cause.
 #>
 
 $ErrorActionPreference = 'Continue'
@@ -34,18 +40,25 @@ if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole(
 # below Block. The two noisy ones are left out on purpose: prevalence/age
 # (01443614-cd74-433a-b99e-2ecdc07bfc25) buries a dev + gaming box in false positives, and
 # PSExec/WMI (d1e49aac-8f56-4280-b9ba-993a6d77406c) breaks Sysinternals and remote admin work.
+# Two of them are still preview rules at Microsoft, which is said out loud rather than left
+# for the user to discover: a preview rule can change behaviour between Defender platform
+# updates, and those are the two to turn off first if something legitimate starts getting blocked.
 $asrTargets = [ordered]@{
     '56a863a9-875e-4185-98a7-b882c64b5ce5' = 'abuse of exploited vulnerable signed drivers'
-    'c0033c00-d16d-4114-a5a0-dc9b3a7d2ceb' = 'copied or impersonated system tools'
+    'c0033c00-d16d-4114-a5a0-dc9b3a7d2ceb' = 'copied or impersonated system tools [preview rule]'
     'b2b3f03d-6a65-4f7b-a9c7-1c7ef74a9ba4' = 'untrusted, unsigned processes run from USB'
     '9e6c4e1f-7d60-472f-ba1a-a39ef669e4b2' = 'credential stealing from LSASS'
-    '33ddedf1-c6e0-47cb-833e-de6133960387' = 'rebooting the machine into Safe Mode'
+    '33ddedf1-c6e0-47cb-833e-de6133960387' = 'rebooting the machine into Safe Mode [preview rule]'
 }
+# Windows default. Defender deletes quarantined files (and the threat history with them) after
+# this many days, so a value well below it destroys the evidence before anyone looks at it.
+$quarantineDefaultDays = 90
 $asrPolicyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules'
 $netbtKey     = 'HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces'
 $explorerKey  = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'
 $lsaKey       = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
 $lanmanKey    = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
+$quarantinePolicyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Quarantine'
 
 function Confirm-Change {
     param([string]$Prompt)
@@ -103,7 +116,21 @@ if ($mp) {
 $exclTotal   = $exclPath.Count + $exclProcess.Count + $exclExt.Count
 
 $nbIfaces = @(Get-ChildItem $netbtKey -ErrorAction SilentlyContinue)
-$nbOn     = @($nbIfaces | Where-Object { (Get-ItemProperty $_.PSPath -Name NetbiosOptions -ErrorAction SilentlyContinue).NetbiosOptions -ne 2 })
+# NetBT keeps an interface key long after the adapter is gone, so a raw count reports NetBIOS
+# as "on" for hardware that no longer exists. Split live from stale the way the health check
+# does - only the live ones are exposure, the stale ones are just registry litter. If the
+# adapter list cannot be read at all, treat every interface as live rather than as gone.
+$liveAdapters = @{}
+Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
+    ForEach-Object { if ($_.InterfaceGuid) { $liveAdapters["$($_.InterfaceGuid)".ToLower()] = $_.Name } }
+$nbLive   = if ($liveAdapters.Count -eq 0) { $nbIfaces }
+            else { @($nbIfaces | Where-Object { $liveAdapters.ContainsKey(($_.PSChildName -replace '^Tcpip_', '').ToLower()) }) }
+$nbStale  = @($nbIfaces | Where-Object { $nbLive -notcontains $_ })
+$nbOn     = @($nbLive | Where-Object { (Get-ItemProperty $_.PSPath -Name NetbiosOptions -ErrorAction SilentlyContinue).NetbiosOptions -ne 2 })
+# Adapter names for the ones still on, so the prompt can say which they are.
+$nbOnNames = @($nbOn | ForEach-Object { $liveAdapters[($_.PSChildName -replace '^Tcpip_', '').ToLower()] } | Where-Object { $_ })
+
+$quarantineDays = if ($mp) { $mp.QuarantinePurgeItemsAfterDelay } else { $null }
 
 $autoRunOff = ((Get-ItemProperty $explorerKey -Name NoDriveTypeAutoRun -ErrorAction SilentlyContinue).NoDriveTypeAutoRun -eq 255) -and
               ((Get-ItemProperty $explorerKey -Name NoAutorun -ErrorAction SilentlyContinue).NoAutorun -eq 1)
@@ -119,8 +146,10 @@ Write-Host "  --- current state ---" -ForegroundColor White
 if ($mp) {
     Write-Host ("  ASR rules below Block          : {0} of {1} targeted" -f $asrPending.Count, $asrTargets.Count) -ForegroundColor Gray
     Write-Host ("  Defender exclusions            : {0}" -f $(if ($exclTotal -eq 0) { 'none (good)' } else { "$exclTotal - unscanned, so review them" })) -ForegroundColor Gray
+    Write-Host ("  Quarantine kept for            : {0}" -f $(if ($null -eq $quarantineDays) { 'unknown' } elseif ($quarantineDays -ge $quarantineDefaultDays) { "$quarantineDays days (default or better)" } else { "$quarantineDays days - below the $quarantineDefaultDays-day default" })) -ForegroundColor Gray
 }
-Write-Host ("  NetBIOS over TCP/IP            : {0}" -f $(if ($nbOn.Count -eq 0) { 'disabled on every interface (good)' } else { "still on/DHCP-controlled on $($nbOn.Count) of $($nbIfaces.Count)" })) -ForegroundColor Gray
+$nbStaleNote = if ($nbStale.Count -gt 0) { " (+$($nbStale.Count) stale entr$(if ($nbStale.Count -eq 1) { 'y' } else { 'ies' }) from removed adapters)" } else { '' }
+Write-Host ("  NetBIOS over TCP/IP            : {0}{1}" -f $(if ($nbOn.Count -eq 0) { 'disabled on every live interface (good)' } else { "still on/DHCP-controlled on $($nbOn.Count) of $($nbLive.Count) live" }), $nbStaleNote) -ForegroundColor Gray
 Write-Host ("  AutoPlay / AutoRun             : {0}" -f $(if ($autoRunOff) { 'disabled by policy (good)' } else { 'not policy-disabled' })) -ForegroundColor Gray
 Write-Host ("  NTLM level                     : {0}" -f $(if ($lmLevel -ge 5) { "$lmLevel (NTLMv2 only, good)" } elseif ($null -eq $lmLevel) { 'not set (client sends NTLMv2 only, but LM/NTLMv1 from others is still accepted)' } else { "$lmLevel (below 5, LM/NTLMv1 still allowed)" })) -ForegroundColor Gray
 Write-Host ("  Admin shares (C`$, ADMIN`$)      : {0}" -f $(if ($sharesOff) { 'off (good)' } elseif ($adminShares) { "on - $(($adminShares.Name) -join ', ')" } else { 'on' })) -ForegroundColor Gray
@@ -134,6 +163,15 @@ if ($mp -and $asrPending.Count -gt 0) {
     $offered = $true
     Write-Host "  Moves these Defender rules from off/audit/warn to Block:" -ForegroundColor DarkGray
     $asrPending | ForEach-Object { Write-Host "    - $($asrTargets[$_])" -ForegroundColor DarkGray }
+    # Measured on a real machine: this rule blocks MSYS2's bash.exe outright (Defender event
+    # 1121), because Windows ships its own bash.exe in System32 for WSL and MSYS2's copy is
+    # unsigned. It killed the MSYS2 installer mid-run. Git for Windows' bash.exe is signed and
+    # is not affected. Said up front rather than left as a mystery months later.
+    if ($asrPending -contains 'c0033c00-d16d-4114-a5a0-dc9b3a7d2ceb') {
+        Write-Host "  Note: 'copied or impersonated system tools' blocks MSYS2's C:\msys64\usr\bin\bash.exe" -ForegroundColor DarkGray
+        Write-Host "  (Windows has its own bash.exe in System32). Exempt it afterwards if you use MSYS2:" -ForegroundColor DarkGray
+        Write-Host "    Add-MpPreference -AttackSurfaceReductionOnlyExclusions 'C:\msys64\*'" -ForegroundColor DarkGray
+    }
     if (Confirm-Change "Set these $($asrPending.Count) ASR rule(s) to Block?") {
         foreach ($id in $asrPending) {
             try { Set-AsrRule -Id $id -Label $asrTargets[$id] }
@@ -144,7 +182,9 @@ if ($mp -and $asrPending.Count -gt 0) {
         $after  = Get-AsrState
         $stuck  = @($asrPending | Where-Object { $after[$_] -ne 1 })
         $wonSet = $asrPending.Count - $stuck.Count
-        if ($wonSet -gt 0) { Write-Host "    $wonSet rule(s) now Block" -ForegroundColor DarkGray; $applied += $wonSet }
+        # One item, not one per rule: $applied counts the changes the user agreed to, and
+        # adding five here made the closing line read "10 items" for six answered prompts.
+        if ($wonSet -gt 0) { Write-Host "    $wonSet rule(s) now Block" -ForegroundColor DarkGray; $applied++ }
         foreach ($id in $stuck) { Write-Host "    still not Block (managed elsewhere?): $($asrTargets[$id])" -ForegroundColor Yellow }
     }
 }
@@ -179,18 +219,55 @@ if ($mp -and $exclTotal -gt 0) {
     }
 }
 
+if ($mp -and $null -ne $quarantineDays -and $quarantineDays -lt $quarantineDefaultDays) {
+    $offered = $true
+    Write-Host "  Defender deletes quarantined files after $quarantineDays day(s) instead of the $quarantineDefaultDays-day default." -ForegroundColor DarkGray
+    Write-Host "  The file and the threat history go with it, so something noticed a week later cannot be looked at." -ForegroundColor DarkGray
+    if (Confirm-Change "Keep quarantined items for $quarantineDefaultDays days?") {
+        try {
+            # A value under the Policies key outranks Set-MpPreference exactly the way it does
+            # for ASR rules, so write it there too when it exists - otherwise the preference is
+            # set, the call succeeds, and Defender keeps purging on the policy's schedule.
+            if ($null -ne (Get-ItemProperty $quarantinePolicyKey -Name PurgeItemsAfterDelay -ErrorAction SilentlyContinue)) {
+                Set-ItemProperty $quarantinePolicyKey -Name PurgeItemsAfterDelay -Value $quarantineDefaultDays -Type DWord -ErrorAction Stop
+            }
+            Set-MpPreference -QuarantinePurgeItemsAfterDelay $quarantineDefaultDays -ErrorAction Stop
+            # Confirm against Defender, like the blocks above - policy can override this too.
+            $nowDays = (Get-MpPreference).QuarantinePurgeItemsAfterDelay
+            if ($nowDays -ge $quarantineDefaultDays) {
+                Write-Host "    quarantine retention is now $nowDays days" -ForegroundColor DarkGray
+                $applied++
+            } else {
+                Write-Host "    still $nowDays days (set by policy?)" -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Host "    could not change quarantine retention: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+}
+
 if ($nbOn.Count -gt 0) {
     $offered = $true
     Write-Host "  NetBIOS over TCP/IP is a pre-2000 name protocol used for spoofing on local networks." -ForegroundColor DarkGray
     Write-Host "  Only legacy SMB/WINS file sharing needs it. Adapters added later default back on - re-run then." -ForegroundColor DarkGray
-    if (Confirm-Change "Disable NetBIOS on all $($nbIfaces.Count) interface(s)?") {
+    if ($nbOnNames.Count -gt 0) { Write-Host "  Still on: $($nbOnNames -join ', ')" -ForegroundColor DarkGray }
+    # Hyper-V rebuilds "vEthernet (Default Switch)" with a fresh interface GUID on every boot, so
+    # it turns up here again after each restart no matter how many times this is run. That one is
+    # a host-internal NAT switch rather than a link to the LAN, so it is noise, not exposure.
+    if ($nbOnNames -match '(?i)Default Switch') {
+        Write-Host "  Hyper-V's 'Default Switch' is rebuilt on every boot and reappears here every time - it" -ForegroundColor DarkGray
+        Write-Host "  is a host-internal NAT switch, not a path to the LAN, so leaving it is no real exposure." -ForegroundColor DarkGray
+    }
+    # Stale keys are written too: it costs nothing, and it stops NetBIOS coming back on if the
+    # adapter is ever reinstalled into the same interface key.
+    if (Confirm-Change "Disable NetBIOS on $($nbLive.Count) live interface(s)$nbStaleNote?") {
         foreach ($iface in $nbIfaces) {
             try { Set-ItemProperty $iface.PSPath -Name NetbiosOptions -Value 2 -Type DWord -ErrorAction Stop }
             catch { Write-Host "    $($iface.PSChildName): $($_.Exception.Message)" -ForegroundColor Yellow }
         }
         $left = @(Get-ChildItem $netbtKey -ErrorAction SilentlyContinue |
                   Where-Object { (Get-ItemProperty $_.PSPath -Name NetbiosOptions -ErrorAction SilentlyContinue).NetbiosOptions -ne 2 })
-        if ($left.Count -eq 0) { Write-Host "    NetBIOS disabled on every interface" -ForegroundColor DarkGray; $applied++ }
+        if ($left.Count -eq 0) { Write-Host "    NetBIOS disabled on every interface (live and stale)" -ForegroundColor DarkGray; $applied++ }
         else { Write-Host "    $($left.Count) interface(s) unchanged" -ForegroundColor Yellow }
     }
 }

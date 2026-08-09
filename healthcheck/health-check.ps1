@@ -3957,7 +3957,11 @@ function Test-PowerHealth {
     # fast startup
 
     $powerKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Power'
-    $hiberBoot = Get-RegValue -Path $powerKey -Name 'HiberbootEnabled'
+    # HiberbootEnabled lives under Session Manager\Power, NOT under Control\Power. Reading it
+    # from the wrong key returns $null on every machine, and a missing value is treated as
+    # "fast startup on" - which reported the finding even where fast startup was already off.
+    $smPowerKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'
+    $hiberBoot = Get-RegValue -Path $smPowerKey -Name 'HiberbootEnabled'
     $hiberOn = Get-RegValue -Path $powerKey -Name 'HibernateEnabled'
     # Fast startup is a hibernation feature, so it cannot be in play when hibernation is off.
     $hibernationActive = -not ($null -ne $hiberOn -and "$hiberOn" -eq '0')
@@ -3968,7 +3972,7 @@ function Test-PowerHealth {
         $hbEvidence = 'HiberbootEnabled = 1'
         $hbConfidence = 'Certain'
         if ($null -eq $hiberBoot) {
-            $hbEvidence = "HiberbootEnabled does not exist under $powerKey, and Windows treats a missing value as on"
+            $hbEvidence = "HiberbootEnabled does not exist under $smPowerKey, and Windows treats a missing value as on"
             $hbConfidence = 'Likely'
         }
         Add-Finding -Severity Low -Title 'Fast startup is enabled' -Evidence $hbEvidence -Impact 'With fast startup, "Shut down" is no longer a real shutdown: the kernel session is hibernated to hiberfil.sys. The NTFS volumes are therefore left marked as in use, so Linux in a dual-boot refuses to mount them writable, and faults that need a real cold start (drivers, firmware, kernel state) survive "Shut down". Only "Restart" gives a full restart.' -Fix 'Control Panel > Power Options > Choose what the power buttons do > Change settings that are currently unavailable > clear "Turn on fast startup".' -Confidence $hbConfidence
@@ -6329,7 +6333,14 @@ function Test-SecurityHealth {
 
     $lmLevel = Get-RegValue -Path $lsaPath -Name 'LmCompatibilityLevel'
     if ($null -eq $lmLevel) {
-        Add-Ok -Message 'The NTLM level is at the Windows default (LmCompatibilityLevel is not overridden) - only NTLMv2 is sent, though LM/NTLMv1 responses from other machines are still accepted (LmCompatibilityLevel = 5 refuses them).'
+        # Reported rather than passed silently: the default is not a fault, but it does leave
+        # something on the table, and harden-extras offers exactly this change. A check that
+        # calls it OK while the hardening script asks to change it puts the two tools at odds.
+        Add-Finding -Severity Info -Title 'The NTLM level is at the Windows default' `
+            -Evidence ("{0}\LmCompatibilityLevel is not set, so the machine sends NTLMv2 only but still accepts LM/NTLMv1 responses from others" -f $lsaPath) `
+            -Impact 'Nothing weak is sent from this machine. Level 5 goes one step further and refuses the crackable LM and NTLMv1 responses coming the other way as well.' `
+            -Fix 'Optional: set LmCompatibilityLevel = 5 (secpol.msc -> Security Options -> "Network security: LAN Manager authentication level" -> "Send NTLMv2 response only. Refuse LM & NTLM"). Skip it if an old NAS or network printer here can only do NTLMv1.' `
+            -Confidence Certain
     } elseif ([int]$lmLevel -lt 3) {
         Add-Finding -Severity High -Title 'The NTLM level allows the old, weak LM/NTLMv1 protocols' `
             -Evidence ("{0}\LmCompatibilityLevel = {1} (3 or higher is required for NTLMv2 only)" -f $lsaPath, $lmLevel) `
@@ -6425,6 +6436,21 @@ function Test-SecurityHealth {
                     -Confidence Certain
             } else {
                 Add-Ok -Message 'Exploit protection (DEP, ASLR, CFG, SEHOP) is at system default or enabled.'
+            }
+
+            # Mandatory ASLR is the one exploit-protection setting Windows does NOT enable by
+            # default, and hardening tools turn it on without saying what it costs. It forces
+            # relocation of images built without /DYNAMICBASE - and it breaks any runtime that
+            # needs a DLL at the same base address in a parent and a forked child. MSYS2 and
+            # Cygwin fork() exactly that way, so their child processes die during DLL init with
+            # 0xC0000142. Reported as Info, not as a fault: it is a deliberate hardening choice,
+            # but one worth knowing about before spending an afternoon on a "broken" toolchain.
+            if ([string]$mitigation.Aslr.ForceRelocateImages -eq 'ON') {
+                Add-Finding -Severity Info -Title 'Mandatory ASLR is on, which is stricter than the Windows default' `
+                    -Evidence 'Get-ProcessMitigation -System reports ASLR.ForceRelocateImages = ON (the Windows default is NOTSET).' `
+                    -Impact 'Images built without /DYNAMICBASE are relocated too. Every current compiler sets that flag, so the gain is limited to legacy binaries - but it breaks MSYS2 and Cygwin fork(), where the child process dies with 0xC0000142 (STATUS_DLL_INIT_FAILED). Git for Windows and GitHub Desktop carry the same incompatibility.' `
+                    -Fix 'Keep it, and exempt the binaries instead of the machine. Harden System Security ships this exact exclusion ("Exclude incompatible GitHub Desktop, Git, and MSYS2 executables from the system-wide Mandatory ASLR") - use that so the tool that set the mitigation also owns the exceptions. By hand: Set-ProcessMitigation -Name bash.exe -Disable ForceRelocateImages. Last resort, machine-wide: Set-ProcessMitigation -System -Disable ForceRelocateImages' `
+                    -Confidence Certain
             }
         } catch {
             Add-Skip -Message "Get-ProcessMitigation -System could not be read (often requires administrator rights): $($_.Exception.Message)"
@@ -7172,12 +7198,11 @@ function Test-PrivacyHealth {
         if (-not $label) { $label = "unknown value ($effective)" }
 
         if ($lvl -eq 0 -and -not $honoursZero) {
-            # The headline nuance: a 0 on Pro/Home is cosmetic.
-            Add-Finding -Severity 'Info' -Title 'Telemetry level 0 is not honoured on this Windows edition' `
-                -Evidence "AllowTelemetry = 0, but the edition is $edition. Level 0 (Security) is only respected on Enterprise, Education, IoT Enterprise and LTSC/LTSB." `
-                -Impact 'Windows clamps the value up to 1 (Required) in practice. The machine still sends basic device, driver and crash data to Microsoft. Level 1 is still the lowest you can actually reach on Pro and Home.' `
-                -Fix 'No action needed if 1 is acceptable - that is the floor on this edition. If telemetry really has to go to 0, that requires Enterprise/Education/LTSC.' `
-                -Confidence 'Certain'
+            # The headline nuance: a 0 on Pro/Home is cosmetic, Windows clamps it up to 1.
+            # Reported as healthy rather than as a finding - 1 is the floor this edition can
+            # reach, so there is nothing to act on, and a finding that can never be closed is
+            # noise. The nuance is still stated, just in one line among the passes.
+            Add-Ok -Message "Telemetry set to level 0, which edition $edition clamps to 1 (Required) - the lowest level this edition can reach"
         } elseif ($lvl -eq 0) {
             Add-Ok -Message "Telemetry set to level 0 (Security), and edition $edition actually honours it"
         } elseif ($lvl -eq 1) {
@@ -8719,7 +8744,14 @@ function Test-LoggingHealth {
                 # configuration scopes it down hard - typically to DLLs loading from places
                 # they have no business loading from. Scoped that way it is supposed to stay
                 # silent, and a quiet week means the machine is clean rather than unmonitored.
-                $sysmonRareByNature = @(7, 8, 10, 25)
+                #
+                # File deletion (23, or its no-archive twin 26) belongs here for the same
+                # reason. Logging every deletion buries the channel in browser cache and build
+                # output, so any configuration that keeps 26 usable scopes it to deletions
+                # worth seeing - executables, scripts, shadow copies, event logs. Days can
+                # pass without one of those on an ordinary machine, and that is the design
+                # working rather than a rule group that is switched off.
+                $sysmonRareByNature = @(7, 8, 10, 23, 25)
                 # The cap matters for what may be claimed afterwards. Get-WinEvent returns the
                 # NEWEST events first, so on a busy machine 20000 records can be a few hours
                 # rather than seven days - and a rule group that fires rarely would then be
@@ -8763,14 +8795,14 @@ function Test-LoggingHealth {
                         # Everything that should be there is there. Anything still missing is
                         # an event that describes an attack, and not seeing one is the goal.
                         $rareNote = if ($missingRare.Count -gt 0) {
-                            " {0} did not occur, which is the expected result - those events describe an attack rather than normal activity." -f
+                            " {0} did not occur, which is the expected result - those events either describe an attack rather than normal activity, or are deliberately scoped down to fire only on the suspicious cases." -f
                                 (@($missingRare | ForEach-Object { "$_ ($($sysmonWanted[$_]))" }) -join ', ')
                         } else { '' }
                         Add-Ok -Message ("Every Sysmon event type that should appear on a running machine has arrived within the last {0}.{1}" -f $windowText, $rareNote)
                     } else {
                         $missingText = (@($missingCommon | ForEach-Object { "$_ ($($sysmonWanted[$_]))" }) -join ', ')
                         $rareText = if ($missingRare.Count -gt 0) {
-                            " Also not seen, but expected not to be: {0} - those describe an attack rather than normal activity." -f
+                            " Also not seen, but expected not to be: {0} - those describe an attack rather than normal activity, or are scoped to fire only on the suspicious cases." -f
                                 (@($missingRare | ForEach-Object { "$_ ($($sysmonWanted[$_]))" }) -join ', ')
                         } else { '' }
                         # Event 1 fires on every process start, so a sample this size always
@@ -8976,7 +9008,13 @@ function Test-SoftwareHealth {
         $text = $Name
         $text = $text -replace '\((?:x64|x86|amd64|arm64|64[- ]bit|32[- ]bit)[^)]*\)', ' '
         $text = $text -replace '(?i)\b(?:x64|x86|amd64|arm64|64-bit|32-bit|edition|version)\b', ' '
-        $text = $text -replace '\bv?\d+(?:[._]\d+)*\b', ' '
+        # Strip version numbers so "Foo 1.2" and "Foo 1.3" group together - but NOT a bare one-
+        # or two-digit number. That is nearly always part of the product name (Outlast 2, Portal
+        # 2, Far Cry 5), and stripping it merged a game with its own sequel and then reported the
+        # pair as "the same program installed in several versions".
+        $text = $text -replace '\bv?\d+(?:[._]\d+)+\b', ' '   # 3.14.7, 1.2, 17_14
+        $text = $text -replace '\bv\d+\b', ' '                # an explicit v7
+        $text = $text -replace '\b\d{3,}\b', ' '              # years and build numbers: 2022, 20228
         $text = $text -replace '[^\p{L}\p{Nd}]+', ' '
         $text = $text -replace '\s+', ' '
         return $text.Trim().ToLowerInvariant()

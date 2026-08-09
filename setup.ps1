@@ -223,17 +223,52 @@ if ($nvidiaGpu.Count -gt 0) {
 
 # MSYS2 installs to <SystemDrive>\msys64 via the Qt installer, which returns exit 1 when that
 # directory already exists. winget can't correlate the existing install to the package either,
-# so a plain Install-App retries (and "fails" with 0x8A150006) on every re-run. Treat a working
-# bash.exe there as already installed, the same way Tor Browser and Discord are handled below.
+# so a plain Install-App retries (and "fails" with 0x8A150006) on every re-run.
 # The drive comes from $env:SystemDrive rather than a literal C: - the default is C:\msys64 on
 # almost every machine, but not on one where Windows lives elsewhere.
 $msys2Root = Join-Path "$env:SystemDrive\" 'msys64'
-if (Test-Path (Join-Path $msys2Root 'usr\bin\bash.exe')) {
-    Write-Host "==> MSYS2.MSYS2" -ForegroundColor Cyan
-    Write-Host "    already installed (skipped; $msys2Root present)" -ForegroundColor DarkGray
-    Write-Event 'SKIP' "MSYS2.MSYS2 already installed ($msys2Root)"
+$msys2Bash = Join-Path $msys2Root 'usr\bin\bash.exe'
+$msys2Pre  = Test-Path $msys2Bash
+if ($msys2Pre) { Write-Host "==> MSYS2.MSYS2" -ForegroundColor Cyan } else { Install-App 'MSYS2.MSYS2' }
+# bash.exe existing is not the same as MSYS2 working. The installer can die partway through with
+# the tree already extracted, so a guard that only tests for the file reports "already installed"
+# on every later run and hides the broken install forever. Run pacman instead.
+#
+# Judged on the OUTPUT, never on $LASTEXITCODE. When bash.exe is blocked from starting at all,
+# PowerShell raises a non-terminating error that sets no exit code and does not enter catch, so
+# $LASTEXITCODE still holds the previous command's - a successful winget - and a blocked MSYS2
+# would be waved through as healthy by the very guard meant to catch it.
+$msys2Ok = $false
+$msys2Probe = ''
+if (Test-Path $msys2Bash) {
+    try { $msys2Probe = (& $msys2Bash -lc 'pacman --version' 2>&1 | Out-String) } catch { $msys2Probe = '' }
+    $msys2Ok = ($msys2Probe -match '(?i)pacman v\d|libalpm')
+}
+if ($msys2Ok) {
+    if ($msys2Pre) {
+        Write-Host "    already installed (skipped; $msys2Root present and pacman answers)" -ForegroundColor DarkGray
+        Write-Event 'SKIP' "MSYS2.MSYS2 already installed ($msys2Root)"
+    }
 } else {
-    Install-App 'MSYS2.MSYS2'
+    # Both of these were hit on a real machine, and in both cases deleting the folder and
+    # reinstalling is wasted effort - the fresh install dies exactly the same way.
+    Write-Host "    MSYS2 does not run from $msys2Root." -ForegroundColor Yellow
+    if ($msys2Probe -match '(?i)access is denied|blocked') {
+        Write-Host "    bash.exe is blocked from starting. Windows ships its own bash.exe in System32, so" -ForegroundColor Yellow
+        Write-Host "    the ASR rule 'copied or impersonated system tools' treats this one as an impostor:" -ForegroundColor Yellow
+        Write-Host "      Add-MpPreference -AttackSurfaceReductionOnlyExclusions '$msys2Root\*'" -ForegroundColor Yellow
+        Write-Event 'FAIL' "MSYS2 blocked from starting at $msys2Root (ASR?)"
+    } elseif ($msys2Probe -match '0xC0000142|dofork|fork: retry') {
+        Write-Host "    bash starts but fork() fails. Mandatory ASLR relocates msys-2.0.dll, which MSYS2" -ForegroundColor Yellow
+        Write-Host "    needs at the same address in parent and child:" -ForegroundColor Yellow
+        Write-Host "      'bash.exe','sh.exe','pacman.exe' | ForEach-Object { Set-ProcessMitigation -Name `$_ -Disable ForceRelocateImages }" -ForegroundColor Yellow
+        Write-Event 'FAIL' "MSYS2 fork fails at $msys2Root (mandatory ASLR?)"
+    } else {
+        Write-Host "    The installation is incomplete. Remove the folder and re-run this script:" -ForegroundColor Yellow
+        Write-Host "      Remove-Item '$msys2Root' -Recurse -Force" -ForegroundColor Yellow
+        Write-Event 'FAIL' "MSYS2 incomplete at $msys2Root (bash/pacman did not run)"
+    }
+    if ($Failed -notcontains 'MSYS2.MSYS2') { $Failed += "MSYS2.MSYS2 (does not run - see the note above)" }
 }
 
 # Tor Browser. The header only goes here in the "already installed" branch - Install-App
@@ -267,17 +302,34 @@ if (-not (Test-Path $vswhere)) {
     Write-Event 'FAIL' 'VC++ toolset - vswhere missing (BuildTools not installed)'
     $Failed += 'VC++ toolset (BuildTools missing)'
 } else {
-    $vcPath = & $vswhere -latest -products * -requires $vcComponent -property installationPath 2>$null
-    if ($vcPath) {
-        Write-Host "    already installed ($vcPath)" -ForegroundColor DarkGray
-        Write-Event 'SKIP' "VC++ toolset already installed ($vcPath)"
+    # Which install must carry the toolset: the NEWEST Build Tools, not "any VS product that
+    # happens to have it". Microsoft.VisualStudio.BuildTools is a rolling winget package - when
+    # it moves from 2022 to 2026 winget cannot correlate the old ARP entry and installs the new
+    # one beside it. Asking "-products * -requires VC.Tools" then matches the OLD install, and
+    # the freshly installed one is left a multi-GB shell with no compiler in it.
+    $vcHave = @(& $vswhere -products * -requires $vcComponent -property installationPath 2>$null | Where-Object { $_ })
+    $btAll  = @(& $vswhere -products 'Microsoft.VisualStudio.Product.BuildTools' -property installationPath 2>$null | Where-Object { $_ })
+    $btPath = @(& $vswhere -products 'Microsoft.VisualStudio.Product.BuildTools' -latest -property installationPath 2>$null |
+                Where-Object { $_ }) | Select-Object -First 1
+    if ($btAll.Count -gt 1) {
+        Write-Host "    note: $($btAll.Count) Build Tools installs are present - the rolling package added a new one beside the old:" -ForegroundColor Yellow
+        $btAll | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
+        Write-Host "      Keep the newest and remove the rest from the Visual Studio Installer when convenient." -ForegroundColor DarkGray
+        Write-Event 'WARN' "multiple Build Tools installs present: $($btAll -join ' | ')"
+    }
+    $vcInBt = [bool]($btPath -and ($vcHave | Where-Object { $_.TrimEnd('\') -eq $btPath.TrimEnd('\') }))
+    if ($vcInBt) {
+        Write-Host "    already installed ($btPath)" -ForegroundColor DarkGray
+        Write-Event 'SKIP' "VC++ toolset already installed ($btPath)"
+    } elseif (-not $btPath -and $vcHave.Count -gt 0) {
+        # No Build Tools at all, but a full Visual Studio carries the toolset - nothing to add.
+        Write-Host "    already installed ($($vcHave[0])) - no Build Tools install to extend" -ForegroundColor DarkGray
+        Write-Event 'SKIP' "VC++ toolset already installed ($($vcHave[0]))"
     } elseif (-not (Test-Path $vsSetup)) {
         Write-Host "    VS setup.exe not found (skipped)" -ForegroundColor Yellow
         Write-Event 'FAIL' 'VC++ toolset - VS setup.exe missing'
         $Failed += 'VC++ toolset (setup.exe missing)'
     } else {
-        $btPath = & $vswhere -products 'Microsoft.VisualStudio.Product.BuildTools' -property installationPath 2>$null |
-                  Select-Object -First 1
         if (-not $btPath) {
             # No hardcoded path: the BuildTools directory tracks the year (2022 -> 2026 -> ...).
             # If vswhere can't report it, BuildTools isn't ready - re-run after it installs.
@@ -294,9 +346,12 @@ if (-not (Test-Path $vswhere)) {
                 '--passive', '--norestart'
             )
             $proc = Start-Process $vsSetup -ArgumentList $vsArgs -Wait -PassThru
-            # trust vswhere over the exit code - it reflects what actually got installed
-            $vcNow = & $vswhere -latest -products * -requires $vcComponent -property installationPath 2>$null
-            if ($vcNow) {
+            # trust vswhere over the exit code - it reflects what actually got installed.
+            # Check the install we just modified, not "any product": another VS install that
+            # already had the toolset would otherwise report success for a failed modify.
+            $vcNow = @(& $vswhere -products * -requires $vcComponent -property installationPath 2>$null |
+                       Where-Object { $_ -and $_.TrimEnd('\') -eq $btPath.TrimEnd('\') })
+            if ($vcNow.Count -gt 0) {
                 Write-Host "    MSVC C++ toolset installed (cl.exe, link.exe, CRT, Windows SDK)" -ForegroundColor DarkGray
                 Write-Event 'OK' 'VC++ toolset (VCTools workload) installed'
                 if ($proc.ExitCode -eq 3010) { Write-Host "    reboot required to finish" -ForegroundColor Yellow }
@@ -731,20 +786,52 @@ if ((Read-Host "Check dual-boot settings? Type y (anything else skips)") -match 
     $hiberEnabled = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' -Name HibernateEnabled -ErrorAction SilentlyContinue).HibernateEnabled
     $rtcUtc       = (Get-ItemProperty $tzKey -Name RealTimeIsUniversal -ErrorAction SilentlyContinue).RealTimeIsUniversal
 
-    # boot store: how many Windows OS loaders, plus non-Windows firmware boot entries
-    $winLoaders = ([regex]::Matches((bcdedit /enum osloader 2>$null | Out-String), '(?im)^\s*description\s+.+$')).Count
+    # boot store: how many Windows OS loaders, plus non-Windows firmware boot entries.
+    # The Windows Recovery Environment is an osloader entry too, but it boots from a ramdisk
+    # rather than from an installed Windows. Counting it reports "2 Windows installs" on an
+    # ordinary single-boot machine, so split the output into entries and drop the ramdisk ones.
+    $osloaderBlocks = @((bcdedit /enum osloader 2>$null | Out-String) -split '(?:\r?\n){2,}' |
+                        Where-Object { $_ -match '(?im)^\s*identifier\s+' })
+    $winLoaders = @($osloaderBlocks | Where-Object { $_ -notmatch '(?im)^\s*device\s+ramdisk' }).Count
+    $recoveryLoaders = $osloaderBlocks.Count - $winLoaders
     $fwDescs = [regex]::Matches((bcdedit /enum firmware 2>$null | Out-String), '(?im)^\s*description\s+(.+?)\s*$') |
                ForEach-Object { $_.Groups[1].Value.Trim() } |
                Where-Object { $_ -and $_ -notmatch '^Windows Boot Manager$' } | Select-Object -Unique
+
+    # Is there actually another OS on the metal? A UTC hardware clock is only correct when the
+    # OTHER OS writes UTC as well (Linux/macOS). WSL does not count - it never touches the RTC.
+    # Two independent signals: the firmware boot entries, and the partition type GUIDs on disk.
+    # Word boundaries on the short, ambiguous names: a firmware entry reading "EFI Search
+    # Device" must not be read as Arch Linux and talk the user into a UTC hardware clock.
+    $otherOsPattern = '(?i)ubuntu|debian|fedora|linux|grub|shim|refind|opensuse|manjaro|\barch\b|\bmint\b|pop.?os|nixos|zorin|endeavour|garuda|elementary|kali|centos|\brocky\b|\balma\b|gentoo|macos|clover|opencore'
+    $otherOsBoot = @($fwDescs | Where-Object { $_ -match $otherOsPattern })
+    # Linux filesystem/root/swap/LVM/RAID and Apple HFS+/APFS partition types.
+    $otherOsGuids = @(
+        '{0fc63daf-8483-4772-8e79-3d69d8477de4}'   # Linux filesystem
+        '{4f68bce3-e8cd-4db1-96e7-fbcaf984b709}'   # Linux x86-64 root
+        '{0657fd6d-a4ab-43c4-84e5-0933c84b4f4f}'   # Linux swap
+        '{e6d6d379-f507-44c2-a23c-238f2a3df928}'   # Linux LVM
+        '{a19d880f-05fc-4d3b-a006-743f0f84911e}'   # Linux RAID
+        '{933ac7e1-2eb4-4f13-b844-0e14e2aef915}'   # Linux /home
+        '{48465300-0000-11aa-aa11-00306543ecac}'   # Apple HFS+
+        '{7c3457ef-0000-11aa-aa11-00306543ecac}'   # Apple APFS
+    )
+    $otherOsParts = @(Get-Partition -ErrorAction SilentlyContinue |
+                      Where-Object { $otherOsGuids -contains "$($_.GptType)".ToLower() })
+    $otherOsFound = ($otherOsBoot.Count -gt 0) -or ($otherOsParts.Count -gt 0)
+    $otherOsWhy = @()
+    if ($otherOsBoot.Count -gt 0)  { $otherOsWhy += "boot entry: $($otherOsBoot -join ', ')" }
+    if ($otherOsParts.Count -gt 0) { $otherOsWhy += "$($otherOsParts.Count) Linux/macOS partition(s) on disk" }
     $secureBoot = try { if (Confirm-SecureBootUEFI) { 'ON' } else { 'OFF' } } catch { 'n/a (legacy BIOS or unsupported)' }
     $blOn = try { @(Get-BitLockerVolume -ErrorAction Stop | Where-Object { $_.ProtectionStatus -eq 'On' }).Count } catch { 0 }
 
     Write-Host "  --- current state ---" -ForegroundColor White
-    Write-Host ("  Windows installs in boot store : {0}" -f $winLoaders) -ForegroundColor Gray
+    Write-Host ("  Windows installs in boot store : {0}{1}" -f $winLoaders, $(if ($recoveryLoaders -gt 0) { " (plus $recoveryLoaders recovery entry/entries, not counted)" })) -ForegroundColor Gray
     if ($fwDescs) { Write-Host ("  Other firmware boot entries    : {0}" -f ($fwDescs -join ', ')) -ForegroundColor Gray }
     else          { Write-Host  "  Other firmware boot entries    : none (only Windows Boot Manager)" -ForegroundColor Gray }
-    Write-Host ("  Fast Startup                   : {0}" -f $(if ($hiberboot -eq 0) { 'OFF (good)' } elseif ($null -eq $hiberboot) { 'not set' } else { 'ON (locks NTFS while hibernation is on)' })) -ForegroundColor Gray
-    Write-Host ("  Hibernation                    : {0}" -f $(if ($hiberEnabled -eq 0) { 'OFF' } elseif ($null -eq $hiberEnabled) { 'unknown' } else { 'ON (hiberfil.sys uses ~RAM-sized disk)' })) -ForegroundColor Gray
+    Write-Host ("  Other OS on the metal          : {0}" -f $(if ($otherOsFound) { "yes - $($otherOsWhy -join '; ')" } else { 'none found (WSL does not count - it never touches the RTC)' })) -ForegroundColor Gray
+    Write-Host ("  Fast Startup                   : {0}" -f $(if ($hiberboot -eq 0) { 'OFF (good)' } elseif ($null -eq $hiberboot) { 'ON (default - the value is not set)' } else { 'ON (locks NTFS while hibernation is on)' })) -ForegroundColor Gray
+    Write-Host ("  Hibernation                    : {0}" -f $(if ($hiberEnabled -eq 0) { 'OFF' } elseif ($null -eq $hiberEnabled) { 'ON (default - the value is not set)' } else { 'ON (hiberfil.sys uses ~RAM-sized disk)' })) -ForegroundColor Gray
     Write-Host ("  Hardware clock                 : {0}" -f $(if ($rtcUtc -eq 1) { 'UTC (matches Linux)' } else { 'local time (Windows default)' })) -ForegroundColor Gray
     Write-Host ("  Secure Boot                    : {0}" -f $secureBoot) -ForegroundColor Gray
     if ($blOn -gt 0) {
@@ -773,18 +860,35 @@ if ((Read-Host "Check dual-boot settings? Type y (anything else skips)") -match 
             }
         } else { Write-Event 'SKIP' 'dual-boot: hibernation left enabled' }
     }
-    # RTC as UTC - only right when the OTHER OS uses UTC (Linux/macOS), NOT Windows+Windows
-    if ($rtcUtc -ne 1) {
+    # RTC as UTC - only right when the OTHER OS on the metal uses UTC (Linux/macOS), never for
+    # Windows + Windows and never on a single-boot machine. The question is therefore gated on
+    # $otherOsFound instead of being asked on every run with a warning line above it: a printed
+    # caveat is not a guard, and answering y without a Linux install only skews the BIOS clock.
+    if ($rtcUtc -ne 1 -and $otherOsFound) {
         $offered = $true
-        Write-Host "  Set the hardware clock to UTC only if your other OS is Linux/macOS. Skip it for Windows + Windows." -ForegroundColor DarkGray
+        Write-Host "  Linux/macOS found on this machine, and it expects the hardware clock in UTC." -ForegroundColor DarkGray
         if ((Read-Host "  Set hardware clock to UTC? Type y") -match '^(y|yes)$') {
             Set-ItemProperty $tzKey -Name RealTimeIsUniversal -Value 1 -Type DWord
             Write-Host "    RealTimeIsUniversal=1 (Windows now reads the RTC as UTC)" -ForegroundColor DarkGray
             Write-Event 'OK' 'dual-boot: RTC set to UTC'
         } else { Write-Event 'SKIP' 'dual-boot: RTC left as local time' }
+    } elseif ($rtcUtc -eq 1 -and -not $otherOsFound) {
+        # Set on a machine with nothing to share the clock with - offer to put it back.
+        $offered = $true
+        Write-Host "  RealTimeIsUniversal=1 is set, but no Linux/macOS install was found. On a Windows-only" -ForegroundColor DarkGray
+        Write-Host "  machine that only offsets the firmware clock and anything reading the RTC directly." -ForegroundColor DarkGray
+        if ((Read-Host "  Put the hardware clock back to local time? Type y") -match '^(y|yes)$') {
+            Remove-ItemProperty $tzKey -Name RealTimeIsUniversal -ErrorAction SilentlyContinue
+            w32tm /resync 2>&1 | Out-Null   # best effort: pull the correct time straight back
+            Write-Host "    RealTimeIsUniversal removed (Windows reads the RTC as local time again)" -ForegroundColor DarkGray
+            Write-Event 'OK' 'dual-boot: RTC restored to local time (no non-Windows OS present)'
+        } else { Write-Event 'SKIP' 'dual-boot: RTC left as UTC' }
+    } elseif ($rtcUtc -ne 1) {
+        Write-Host "  Hardware clock stays on local time - correct with no Linux/macOS on the machine." -ForegroundColor DarkGray
+        Write-Event 'SKIP' 'dual-boot: RTC question not asked (no non-Windows OS detected)'
     }
     if (-not $offered) { Write-Host "  nothing to change - already dual-boot friendly" -ForegroundColor DarkGray }
-    Write-Event 'INFO' "dual-boot state: winLoaders=$winLoaders fastStartup=$hiberboot hibernation=$hiberEnabled rtcUtc=$rtcUtc secureBoot=$secureBoot bitlocker=$blOn"
+    Write-Event 'INFO' "dual-boot state: winLoaders=$winLoaders recoveryLoaders=$recoveryLoaders otherOs=$otherOsFound fastStartup=$hiberboot hibernation=$hiberEnabled rtcUtc=$rtcUtc secureBoot=$secureBoot bitlocker=$blOn"
 } else {
     Write-Host "    skipped dual-boot checks" -ForegroundColor DarkGray
     Write-Event 'SKIP' 'dual-boot checks skipped by user'
