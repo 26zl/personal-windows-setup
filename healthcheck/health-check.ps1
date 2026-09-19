@@ -6978,11 +6978,14 @@ function Test-SecurityHealth {
     try {
         $bcdObjects = @(Get-ChildItem -LiteralPath 'HKLM:\BCD00000000\Objects' -ErrorAction Stop)
         $bcdRead = ($bcdObjects.Count -gt 0)
-        # BcdLibraryBoolean_* element codes. 12000004 is the entry description.
+        # BCD element codes. 12000004 is the entry description. "bcdedit /debug on" is stored as
+        # BcdOSLoaderBoolean_KernelDebuggerEnabled (260000a0); 16000010 is
+        # BcdLibraryBoolean_DebuggerEnabled, which is "bcdedit /bootdebug on".
         $bootChecks = @{
             '16000049' = @{ Name = 'testsigning'; Means = 'unsigned kernel drivers are allowed to load' }
             '16000048' = @{ Name = 'nointegritychecks'; Means = 'driver signature enforcement is switched off entirely' }
-            '16000010' = @{ Name = 'kernel debugging'; Means = 'another machine can read and write this one memory over the debug transport' }
+            '260000a0' = @{ Name = 'kernel debugging'; Means = 'another machine can read and write this one memory over the debug transport' }
+            '16000010' = @{ Name = 'boot debugging'; Means = 'the boot loader waits for and obeys a debugger before Windows has started' }
         }
         foreach ($bcdObject in $bcdObjects) {
             foreach ($code in $bootChecks.Keys) {
@@ -7004,10 +7007,10 @@ function Test-SecurityHealth {
             Add-Finding -Severity High -Title 'The boot configuration disables a kernel protection' `
                 -Evidence ($bcdFlags -join '; ') `
                 -Impact 'These flags are meant for driver development. Left on, they undo driver signature enforcement - the thing that stops a vulnerable or malicious kernel driver from loading, which is the route the whole vulnerable-driver blocklist exists to block. Some anti-cheat and DRM systems also refuse to run.' `
-                -Fix 'As administrator: bcdedit /set testsigning off, bcdedit /set nointegritychecks off, bcdedit /debug off - then restart. Check with: bcdedit /enum {current}' `
+                -Fix 'As administrator: bcdedit /set testsigning off, bcdedit /set nointegritychecks off, bcdedit /debug off, bcdedit /bootdebug off - then restart. Check with: bcdedit /enum {current}' `
                 -Confidence Certain
         } else {
-            Add-Ok -Message ("None of the {0} boot entries has a kernel protection switched off (testsigning, nointegritychecks and kernel debugging are all off)." -f $bcdObjects.Count)
+            Add-Ok -Message ("None of the {0} boot entries has a kernel protection switched off (testsigning, nointegritychecks, kernel debugging and boot debugging are all off)." -f $bcdObjects.Count)
         }
     } catch {
         Add-Skip -Message 'The BCD hive (HKLM:\BCD00000000) could not be read, so boot configuration flags were not assessed - it requires administrator rights.'
@@ -7248,8 +7251,12 @@ function Test-PrivacyHealth {
 
     # advertising ID
 
+    # The policy wins over the per-user switch: with it set, Windows hands out no ID whatever HKCU says.
+    $adPolicy = Get-RegValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo' -Name 'DisabledByGroupPolicy'
     $adId = Get-RegValue -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo' -Name 'Enabled'
-    if ($null -eq $adId -or $adId -eq 1) {
+    if ($adPolicy -eq 1) {
+        Add-Ok -Message 'Advertising ID is turned off by policy (AdvertisingInfo\DisabledByGroupPolicy = 1)'
+    } elseif ($null -eq $adId -or $adId -eq 1) {
         $adEvidence = if ($null -eq $adId) { 'AdvertisingInfo\Enabled is not set (Windows treats that as on).' } else { 'AdvertisingInfo\Enabled = 1.' }
         Add-Finding -Severity 'Low' -Title 'Advertising ID is active' `
             -Evidence $adEvidence `
