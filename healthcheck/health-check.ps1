@@ -4057,7 +4057,7 @@ function Test-PowerHealth {
                 Add-Ok -Message 'No devices are allowed to wake the machine from sleep.'
             } else {
                 # Keyboards and mice are armed by default and are harmless; a NIC is the one that wakes a machine at night
-                $netDevices = @($armedDevices | Where-Object { $_ -match 'NIC|Ethernet|Wi-?Fi|Wireless|Network|LAN|802\.11' })
+                $netDevices = @($armedDevices | Where-Object { $_ -match '\b(?:NIC|Ethernet|GbE|Wi-?Fi|Wireless|Network|W?LAN)\b|802\.11' })   # word boundaries: a bare LAN also matched ELAN touchpads
                 if ($netDevices.Count -gt 0) {
                     Add-Finding -Severity Low -Title 'The network adapter is allowed to wake the machine' -Evidence ("$($netDevices.Count) of $($armedDevices.Count) armed devices are network adapters: " + (& $limitText ($netDevices -join '; ') 180)) -Impact 'A network adapter that is wake armed can wake the machine on a magic packet or on a pattern match in the traffic. With the wrong driver setting, ordinary broadcast traffic keeps the machine awake - the typical symptom is a PC that is on in the morning without anyone touching it.' -Fix 'Device Manager > the network adapter > Properties > Power Management: keep only "Only allow a magic packet to wake the computer", or clear "Allow this device to wake the computer". Check afterwards with: powercfg /devicequery wake_armed' -Confidence Likely
                 } else {
@@ -4434,7 +4434,7 @@ function Test-PowerHealth {
   Network - what the machine exposes to the net it is standing on, and what it
   trusts coming back.
 
-  No netsh parsing anywhere. Its output is translated, so on a Norwegian Windows
+  No matching on translated netsh text. Its output is translated, so on a Norwegian Windows
   every string match would silently fail and the check would report "all clear".
   Where a value only exists as localised text - Wi-Fi encryption, the WinHTTP
   proxy - it is read from the WLAN profile XML and from the raw registry blob
@@ -5378,7 +5378,7 @@ function Test-NetworkHealth {
             $weakProfiles = @()
             $namedProfiles = @()
             foreach ($wlanName in $wlanNames) {
-                $detail = & netsh wlan show profile name="$wlanName" key=clear 2>&1 | Out-String
+                $detail = & netsh wlan show profile name="$wlanName" 2>&1 | Out-String   # never key=clear: only the protocol names are needed, not the passphrase
                 # The loose line parse above can pick up non-profile lines; netsh itself
                 # knows which names are real and exits non-zero for the rest.
                 if ($LASTEXITCODE -ne 0) { continue }
