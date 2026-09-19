@@ -180,10 +180,7 @@ $winget = @(
     'WireGuard.WireGuard'
     'MullvadVPN.MullvadVPN'           # Mullvad VPN
 
-    # cybersecurity
-    'WiresharkFoundation.Wireshark'
-    'Insecure.Nmap'
-    'PortSwigger.BurpSuite.Community'
+    # tools
     'KeePassXCTeam.KeePassXC'
 
     # privacy / debloat
