@@ -473,7 +473,10 @@ if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     gh auth status 2>$null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "    opening your browser to log in..." -ForegroundColor DarkGray
+        # gh prints a one-time device code; pause the transcript so it never lands on disk.
+        if ($log) { try { Stop-Transcript | Out-Null } catch { } }
         gh auth login --hostname github.com --git-protocol https --web
+        if ($log) { try { Start-Transcript -Path $log -Append | Out-Null } catch { $log = $null } }
     } else {
         Write-Host "    already logged in to GitHub" -ForegroundColor DarkGray
     }
