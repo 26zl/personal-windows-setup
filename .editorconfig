@@ -1,0 +1,24 @@
+# Matches the files in the repository: four-space PowerShell, two-space YAML
+# and Markdown, LF everywhere, UTF-8 without BOM, a final newline.
+#
+# LF applies to *.ps1 as well. `irm <raw-url> | iex` runs the raw LF bytes,
+# setup.ps1 and sysmon/install-sysmon.ps1 pin files by SHA-256, and the
+# contract tests assert LF and no BOM; .gitattributes enforces the same.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{yml,yaml,md}]
+indent_size = 2
+
+# Exported Sysmon configuration, pinned by SHA-256 in install-sysmon.ps1:
+# its tabs and whitespace must stay exactly as committed.
+[sysmon/sysmonconfig-export.xml]
+indent_style = tab
+trim_trailing_whitespace = false
