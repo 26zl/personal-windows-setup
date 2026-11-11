@@ -9,10 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  # These scripts only ever run on Windows, and several of the things that break them
-  # are Windows-only: Windows PowerShell 5.1 parses a few constructs differently from
-  # PowerShell 7, and the Windows-only cmdlets the scripts call do not exist on Linux.
-  # Ubuntu alone would pass while 5.1 fails on a user's machine.
+  # The scripts only run on Windows, so Ubuntu alone would miss Windows-only breakage.
   pester:
     strategy:
       fail-fast: false
@@ -25,17 +22,14 @@ jobs:
       - name: Run Pester contract tests
         shell: pwsh
         run: |
-          Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -SkipPublisherCheck
-          Import-Module Pester -MinimumVersion 5.0
+          Import-Module (./.github/scripts/Install-PinnedModule.ps1 -Name Pester -Version 5.7.1 -Sha256 4A27904C6814A5FBE4758F8E49861F6A1994AEE77B71165A5C43C0371BA6C580)
           $cfg = New-PesterConfiguration
-          $cfg.Run.Path = './healthcheck'
+          $cfg.Run.Path = '.'
           $cfg.Output.Verbosity = 'Detailed'
           $cfg.Run.Exit = $true
           Invoke-Pester -Configuration $cfg
 
-  # Windows PowerShell 5.1 is the shell a fresh Windows install opens by default, so
-  # every script has to parse there too. This checks parsing and the contract tests
-  # under 5.1 specifically - pwsh above does not cover it.
+  # Windows PowerShell 5.1 is the default shell on a fresh install; the pwsh jobs do not cover it.
   windows-powershell-5:
     runs-on: windows-latest
     timeout-minutes: 10
@@ -60,10 +54,9 @@ jobs:
       - name: Run Pester contract tests under Windows PowerShell 5.1
         shell: powershell
         run: |
-          Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -SkipPublisherCheck
-          Import-Module Pester -MinimumVersion 5.0
+          Import-Module (./.github/scripts/Install-PinnedModule.ps1 -Name Pester -Version 5.7.1 -Sha256 4A27904C6814A5FBE4758F8E49861F6A1994AEE77B71165A5C43C0371BA6C580)
           $cfg = New-PesterConfiguration
-          $cfg.Run.Path = './healthcheck'
+          $cfg.Run.Path = '.'
           $cfg.Output.Verbosity = 'Detailed'
           $cfg.Run.Exit = $true
           Invoke-Pester -Configuration $cfg
@@ -76,7 +69,7 @@ jobs:
       - name: Run PSScriptAnalyzer
         shell: pwsh
         run: |
-          Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Force -Scope CurrentUser
+          Import-Module (./.github/scripts/Install-PinnedModule.ps1 -Name PSScriptAnalyzer -Version 1.25.0 -Sha256 14E634C828EB98EFB9F40B2918BA90F139ED5ECCDF663A2A747736D996995D60)
           $results = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
           $results | Format-Table -AutoSize
           if ($results | Where-Object Severity -in 'Error','Warning') { exit 1 }
@@ -84,8 +77,9 @@ jobs:
         shell: pwsh
         run: |
           $checks = @(
-            @{ File = 'office/OfficeSetup.exe';        Script = 'setup.ps1';                 Pat = "officeSha256\s*=\s*'([A-F0-9]{64})'" }
             @{ File = 'sysmon/sysmonconfig-export.xml'; Script = 'sysmon/install-sysmon.ps1'; Pat = "configSha256\s*=\s*'([A-F0-9]{64})'" }
+            @{ File = 'sysmon/install-sysmon.ps1';      Script = 'setup.ps1';                 Pat = "sysmonScriptSha256\s*=\s*'([A-F0-9]{64})'" }
+            @{ File = 'hardening/harden-extras.ps1';    Script = 'setup.ps1';                 Pat = "hardenScriptSha256\s*=\s*'([A-F0-9]{64})'" }
           )
           $ok = $true
           foreach ($c in $checks) {
@@ -97,3 +91,101 @@ jobs:
             else                      { Write-Host "OK  $($c.File) matches pin" }
           }
           if (-not $ok) { exit 1 }
+      - name: Verify pinned external downloads
+        shell: pwsh
+        run: |
+          $setup = Get-Content -Raw setup.ps1
+          function Get-Pin([string]$Name) {
+            if ($setup -match "\`$$Name\s*=\s*'([^']+)'") { return $Matches[1] }
+            throw "no `$$Name in setup.ps1"
+          }
+          $nvimCommit = Get-Pin 'nvimInstallerCommit'
+          $pspCommit  = Get-Pin 'pspCommit'
+          $checks = @(
+            @{ Url = "https://github.com/26zl/nvim/raw/$nvimCommit/install.ps1"; Sha = Get-Pin 'nvimInstallerSha256' }
+            @{ Url = "https://github.com/26zl/PowerShellPerfect/raw/$pspCommit/setup.ps1"; Sha = Get-Pin 'pspSetupSha256' }
+            @{ Url = "https://github.com/neovim/neovim/releases/download/$(Get-Pin 'nvimTarballVersion')/nvim-linux-x86_64.tar.gz"; Sha = Get-Pin 'nvimTarballSha256' }
+            # A moving branch: this fails when AndyFul ships a new build, before setup.ps1 would.
+            @{ Url = Get-Pin 'cdUrl'; Sha = Get-Pin 'cdSha256' }
+          )
+          $ok = $true
+          $tmp = Join-Path ([IO.Path]::GetTempPath()) 'pinned-download.bin'
+          foreach ($c in $checks) {
+            Invoke-WebRequest -Uri $c.Url -OutFile $tmp
+            $actual = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
+            if ($actual -ne $c.Sha) { Write-Host "::error::$($c.Url) is $actual, the pin is $($c.Sha)"; $ok = $false }
+            else                    { Write-Host "OK  $($c.Url)" }
+          }
+          # PowerShellPerfect's bundle hash, computed the way its own setup.ps1 does.
+          $files = [ordered]@{ profile = 'Microsoft.PowerShell_profile.ps1'; theme = 'theme.json'; terminal = 'terminal-config.json' }
+          $parts = foreach ($key in $files.Keys) {
+            Invoke-WebRequest -Uri "https://raw.githubusercontent.com/26zl/PowerShellPerfect/$pspCommit/$($files[$key])" -OutFile $tmp
+            "${key}:$((Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash)"
+          }
+          $sha = [System.Security.Cryptography.SHA256]::Create()
+          $bundle = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($parts -join ':'))).Replace('-', '')
+          if ($bundle -ne (Get-Pin 'pspBundleSha256')) { Write-Host "::error::PowerShellPerfect bundle at $pspCommit is $bundle"; $ok = $false }
+          else                                        { Write-Host "OK  PowerShellPerfect bundle at $pspCommit" }
+          if (-not $ok) { exit 1 }
+
+  # Runs the scripts that change the system for real, which is only safe on a throwaway runner.
+  windows-integration:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The hardening pass changes nothing when every answer is n
+        shell: powershell
+        run: |
+          $snapshot = {
+            $state = [ordered]@{}
+            try {
+              $p = Get-MpPreference -ErrorAction Stop
+              $state.AsrIds      = @($p.AttackSurfaceReductionRules_Ids) -join ','
+              $state.AsrActions  = @($p.AttackSurfaceReductionRules_Actions) -join ','
+              $state.Exclusions  = (@($p.ExclusionPath) + @($p.ExclusionProcess) + @($p.ExclusionExtension)) -join ','
+              $state.Quarantine  = $p.QuarantinePurgeItemsAfterDelay
+            } catch { $state.Defender = 'unavailable' }
+            foreach ($key in 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules',
+                             'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Quarantine',
+                             'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer',
+                             'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa',
+                             'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters') {
+              $item = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+              if ($item) { $state[$key] = ($item.PSObject.Properties | Where-Object Name -notlike 'PS*' | ForEach-Object { "$($_.Name)=$($_.Value -join ',')" }) -join ';' }
+            }
+            Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces' -ErrorAction SilentlyContinue | ForEach-Object {
+              $state[$_.PSChildName] = (Get-ItemProperty -LiteralPath $_.PSPath -Name NetbiosOptions -ErrorAction SilentlyContinue).NetbiosOptions
+            }
+            $state.Shares = (Get-SmbShare -ErrorAction SilentlyContinue | ForEach-Object Name | Sort-Object) -join ','
+            $state.Logs   = (Get-ChildItem "$env:LOCALAPPDATA\windows-setup\logs" -ErrorAction SilentlyContinue | ForEach-Object Name) -join ','
+            $state | ConvertTo-Json -Depth 3
+          }
+          $before = & $snapshot
+          1..40 | ForEach-Object { 'n' } | powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\hardening\harden-extras.ps1
+          $after = & $snapshot
+          if ($before -ne $after) {
+            Write-Host '::error::harden-extras.ps1 changed something although every answer was n'
+            Compare-Object ($before -split "`n") ($after -split "`n") | Format-Table -AutoSize | Out-String -Width 300 | Write-Host
+            exit 1
+          }
+          Write-Host 'OK  nothing changed and nothing was written'
+      - name: Install Sysmon for real, re-run it, and keep a larger log
+        shell: powershell
+        run: |
+          $channel = 'Microsoft-Windows-Sysmon/Operational'
+          # stdout only: under this step's 'stop' preference, Windows PowerShell turns merged stderr lines into errors.
+          $first = powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\sysmon\install-sysmon.ps1 | Out-String
+          Write-Host $first
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::install-sysmon.ps1 failed (exit $LASTEXITCODE)"; exit 1 }
+          if ($first -match 'staged but not active') { Write-Host '::warning::the built-in Sysmon feature needs a reboot on this image; the install was not exercised'; exit 0 }
+          wevtutil.exe sl $channel /ms:2147483648
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\sysmon\install-sysmon.ps1
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::the re-run failed (exit $LASTEXITCODE)"; exit 1 }
+          $max = (Get-WinEvent -ListLog $channel).MaximumSizeInBytes
+          if ($max -lt 2147483648) { Write-Host "::error::the re-run shrank the Sysmon log to $max bytes"; exit 1 }
+          $svc = Get-CimInstance Win32_Service -Filter "Name='Sysmon' OR Name='Sysmon64'" | Select-Object -First 1
+          if (-not $svc -or $svc.State -ne 'Running') { Write-Host '::error::Sysmon is not running'; exit 1 }
+          $left = @(Get-ChildItem (Join-Path $env:SystemRoot 'Temp') -Directory -Filter 'windows-setup-*' -ErrorAction SilentlyContinue)
+          if ($left) { Write-Host "::error::staging folders left behind: $($left.Name -join ', ')"; exit 1 }
+          Write-Host "OK  $($svc.Name) running, log kept at $max bytes, no staging folder left"

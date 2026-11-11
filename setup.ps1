@@ -2,20 +2,54 @@
   Personal Windows 11 Pro installer to run after a factory reset.
   Run in an ELEVATED PowerShell:
     irm https://github.com/26zl/personal-windows-setup/raw/main/setup.ps1 | iex
+  Preview every step without changing anything:
+    & ([scriptblock]::Create((irm https://github.com/26zl/personal-windows-setup/raw/main/setup.ps1))) -WhatIf
+  Unattended: -Yes answers y to every prompt, -Skip <step,...> answers n for those steps,
+  and a session without a console answers n. The hardening pass still asks per change.
   Add software by dropping its winget ID into a list below (winget search <name>).
-  Re-running skips installed apps; failures are listed at the end. Every run writes a
-  full transcript plus a timestamped event log to %LOCALAPPDATA%\windows-setup\logs.
+  Re-running skips installed apps. Failures are listed at the end and make the run end in an
+  error (exit code 1 when run as a file). Every run writes a full transcript plus a timestamped
+  event log to %LOCALAPPDATA%\windows-setup\logs, kept for 90 days.
   On a brand-new machine: run once, REBOOT (to finish Windows features + WSL2), then
   run again - the second pass completes steps that were waiting on PATH or WSL.
 #>
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    # Answer y to every opt-in prompt (use -Skip to leave steps out).
+    [switch]$Yes,
+    # Opt-in steps to answer n to without asking.
+    [ValidateSet('Scoop', 'GitHub', 'Neovim', 'NeovimWsl', 'Hardening', 'ClaudeCode', 'DualBoot', 'Hibernation',
+        'RtcUtc', 'RtcLocal', 'Upgrade', 'DiskCleanup', 'TweakTools', 'Win11Debloat', 'Winhance', 'PowerShellPerfect')]
+    [string[]]$Skip = @(),
+    # Branch, tag or commit of this repo to fetch install-sysmon.ps1 and harden-extras.ps1 from
+    # when no local copy exists; pin it to the ref this setup.ps1 came from.
+    [ValidatePattern('^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$')]
+    [string]$RepoRef = 'main'
+)
 
-$ErrorActionPreference = 'Continue'
+if ($env:NO_COLOR) {
+    # https://no-color.org: the same output without colours.
+    function Write-Host {
+        [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidOverwritingBuiltInCmdlets', '', Justification = 'Forwards to the real Write-Host without colours when NO_COLOR is set.')]
+        param(
+            [Parameter(Position = 0, ValueFromPipeline, ValueFromRemainingArguments)][object]$Object,
+            [switch]$NoNewline, [object]$Separator,
+            [System.ConsoleColor]$ForegroundColor, [System.ConsoleColor]$BackgroundColor
+        )
+        process {
+            $null = $PSBoundParameters.Remove('ForegroundColor')
+            $null = $PSBoundParameters.Remove('BackgroundColor')
+            Microsoft.PowerShell.Utility\Write-Host @PSBoundParameters
+        }
+    }
+}
+
 try   { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13 }
 catch { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 }
 
-# admin + winget guards
+# admin + winget guards; a -WhatIf preview changes nothing, so it runs without elevation
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole(
+if (-not $WhatIfPreference -and -not ([Security.Principal.WindowsPrincipal]$identity).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "Run this in an ELEVATED PowerShell (right-click > Run as administrator)." -ForegroundColor Red
     return
@@ -24,40 +58,147 @@ if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
     Write-Host "winget not found. Install 'App Installer' from the Microsoft Store, then re-run." -ForegroundColor Red
     return
 }
+# Restored at the end: with iex this is the caller's own session.
+$previousErrorAction = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 
-# Persist a transcript and event summary outside the temporary directory.
-$logDir = Join-Path $env:LOCALAPPDATA 'windows-setup\logs'
-try { $null = New-Item $logDir -ItemType Directory -Force } catch { $logDir = $env:TEMP }
+# Pins. The scripts this repo ships are checked against these when they are downloaded;
+# refresh them with Get-FileHash in the same commit as the file (CI checks they match).
+$RepoRaw            = "https://github.com/26zl/personal-windows-setup/raw/$RepoRef"
+$sysmonScriptSha256 = 'B4428769F1614E02AF08EEB7EB32AC2BD065EF9811021525C6591D05470BD4EB'
+$hardenScriptSha256 = '6AC18B73FE15EF041A9CE584D505E441AD07B5B639A996693CF90D642ED3D31D'
+# Installers from the owner's other repos: one commit each, plus the file's SHA-256.
+$nvimInstallerCommit = '55ea8ac1ceb2b0a977243a5f190911a6b1015178'
+$nvimInstallerSha256 = '3BA806439D39B7819A4C34FD298D0119FD932A32BD38F81C8985FFC7DBA2E2B1'
+$pspCommit           = 'd6a955015831e7e9312f72aa93ed0dc9fb843f20'
+$pspSetupSha256      = '9CA52E0F55675029D48DB344CC9D4E41BA55B9C7C0350AA5A12C0DE5C3FA89AF'
+# PowerShellPerfect's own bundle check (profile, theme.json, terminal-config.json at $pspCommit).
+$pspBundleSha256     = '88C27D21F36318093A37BACD7A5C1879E630134E53236DD24F6382812C02306B'
+# Neovim for WSL: the release tarball and the SHA-256 GitHub publishes for it.
+$nvimTarballVersion  = 'v0.12.6'
+$nvimTarballSha256   = '474430d53e6264f6d6dd18db42d6dc9df3a1b56ca9e88a325bbf860e1a811d87'
+
+# Persist a transcript and event summary outside the temporary directory; a preview writes nothing.
+$logDir   = Join-Path $env:LOCALAPPDATA 'windows-setup\logs'
 $stamp    = '{0:yyyyMMdd-HHmmss}' -f (Get-Date)
-$log      = Join-Path $logDir "transcript-$stamp.log"
-$eventLog = Join-Path $logDir "events-$stamp.log"
 $runStart = Get-Date
-try { Start-Transcript -Path $log -Append | Out-Null } catch { $log = $null }
+$log      = $null
+$eventLog = $null
+if (-not $WhatIfPreference) {
+    try { $null = New-Item $logDir -ItemType Directory -Force } catch { $logDir = $env:TEMP }
+    # Keep 90 days of run logs.
+    Get-ChildItem -LiteralPath $logDir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^(transcript|events)-\d{8}-\d{6}\.log$' -and $_.LastWriteTime -lt (Get-Date).AddDays(-90) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    $log      = Join-Path $logDir "transcript-$stamp.log"
+    $eventLog = Join-Path $logDir "events-$stamp.log"
+    try { Start-Transcript -Path $log -Append | Out-Null } catch { $log = $null }
+}
+if ($Yes)  { Write-Host "Answering y to every prompt (-Yes)." -ForegroundColor DarkGray }
+if ($Skip) { Write-Host "Answering n for: $($Skip -join ', ') (-Skip)" -ForegroundColor DarkGray }
 
 function Write-Event {
     param([string]$Level, [string]$Message)
-    if (-not $script:eventLog) { return }
-    try   { "[{0:yyyy-MM-dd HH:mm:ss}] [{1,-4}] {2}" -f (Get-Date), $Level, $Message | Add-Content $script:eventLog -Encoding UTF8 }
-    catch { $script:eventLog = $null }   # never let logging break the run
+    if (-not $eventLog) { return }
+    try   { "[{0:yyyy-MM-dd HH:mm:ss}] [{1,-4}] {2}" -f (Get-Date), $Level, $Message | Add-Content $eventLog -Encoding UTF8 }
+    catch { Write-Verbose -Message "event log not written: $($_.Exception.Message)" }   # never let logging break the run
 }
 $osCaption = (Get-CimInstance Win32_OperatingSystem).Caption
 Write-Event 'INFO' "run started - user=$env:USERNAME host=$env:COMPUTERNAME os=$osCaption"
 
-$Failed = @()
+# A list rather than an array: functions add to it in place, which also works when the script
+# runs as a script block, where $script: would point at the caller's session instead.
+$Failed = New-Object System.Collections.Generic.List[string]
 $WingetOk = 0, -1978335189, -1978335135
 
+function Confirm-Step {
+    # One answer path for every opt-in step: -Skip and a session without a console say n,
+    # -Yes says y, -WhatIf only reports the question.
+    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Question)
+    if ($Skip -contains $Name) { Write-Host "    $Name skipped (-Skip)" -ForegroundColor DarkGray; return $false }
+    if ($WhatIfPreference) { Write-Host "    What if: would ask '$($Question.Trim())'" -ForegroundColor DarkGray; return $false }
+    if ($Yes) { Write-Host "    $($Question.Trim()) y (-Yes)" -ForegroundColor DarkGray; return $true }
+    try { return (([string](Read-Host "$Question Type y (anything else skips)")) -match '^(y|yes)$') }
+    catch { Write-Host "    no console to ask - answering n" -ForegroundColor DarkGray; return $false }
+}
+
+function Test-WhatIf {
+    # True under -WhatIf, after printing the change that would have been made.
+    param([Parameter(Mandatory)][string]$Action)
+    if (-not $WhatIfPreference) { return $false }
+    Write-Host "    What if: $Action" -ForegroundColor DarkGray
+    $true
+}
+
+function New-StagingDirectory {
+    # Admin-only folder under %SystemRoot%\Temp, so a non-elevated process cannot swap a
+    # verified file before it runs.
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    $path = Join-Path $env:SystemRoot ('Temp\windows-setup-' + [guid]::NewGuid().ToString('N'))
+    if (-not $PSCmdlet.ShouldProcess($path, 'create admin-only staging folder')) { return $null }
+    $admins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+    $system = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $acl.SetOwner($admins)
+    foreach ($sid in $admins, $system) {
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+    }
+    if ($PSVersionTable.PSEdition -eq 'Core') { $null = [System.IO.FileSystemAclExtensions]::CreateDirectory($acl, $path) }
+    else { $null = [System.IO.Directory]::CreateDirectory($path, $acl) }
+    $path
+}
+
+function Remove-StagedFile {
+    # Deletes the staging folder a verified download sits in, and nothing else.
+    [CmdletBinding(SupportsShouldProcess)]
+    param([string]$Path)
+    if (-not $Path) { return }
+    $dir = Split-Path -Parent $Path
+    $isStaging = ((Split-Path -Parent $dir) -eq (Join-Path $env:SystemRoot 'Temp')) -and
+                 ((Split-Path -Leaf $dir) -match '^windows-setup-[0-9a-f]{32}$')
+    if ($isStaging -and $PSCmdlet.ShouldProcess($dir, 'remove staging folder')) {
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Save-VerifiedDownload {
+    # Returns the downloaded file's path only when its SHA-256 matches the pin.
+    param([Parameter(Mandatory)][string]$Uri, [Parameter(Mandatory)][string]$Sha256, [Parameter(Mandatory)][string]$FileName)
+    $path = Join-Path (New-StagingDirectory) $FileName
+    try {
+        Invoke-WebRequest $Uri -OutFile $path -UseBasicParsing -TimeoutSec 300
+        $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+        if ($actual -ne $Sha256) { throw "SHA-256 mismatch for $Uri (pinned $Sha256, got $actual)" }
+    } catch {
+        Remove-StagedFile $path
+        throw
+    }
+    $path
+}
+
+function Resolve-OwnScript {
+    # The copy next to this script wins (a clone); otherwise the file at $RepoRef, checked against its pin.
+    param([Parameter(Mandatory)][string]$RelativePath, [Parameter(Mandatory)][string]$Sha256)
+    if ($PSScriptRoot) {
+        $local = Join-Path $PSScriptRoot $RelativePath
+        if (Test-Path -LiteralPath $local) { return $local }
+    }
+    Save-VerifiedDownload -Uri "$RepoRaw/$RelativePath" -Sha256 $Sha256 -FileName (Split-Path -Leaf $RelativePath)
+}
+
 function Install-App {
-    # --no-upgrade keeps a re-run additive: without it winget silently upgrades packages
-    # that are already installed, which would move versions before the user has been
-    # asked about "winget upgrade --all" at the end of the run.
+    # --no-upgrade keeps re-runs additive; upgrades happen only in the opt-in step at the end.
     param([string]$Id, [string]$Source = 'winget')
     Write-Host "==> $Id" -ForegroundColor Cyan
+    if (Test-WhatIf "winget install --id $Id --source $Source") { return }
     winget install --id $Id --exact --source $Source --silent --no-upgrade --accept-source-agreements --accept-package-agreements
     if ($LASTEXITCODE -eq 0) { Write-Event 'OK' "$Id installed" ; return }
     if ($WingetOk -contains $LASTEXITCODE) { Write-Event 'SKIP' "$Id already installed (exit $LASTEXITCODE)"; return }
     Write-Host "    FAILED: $Id (exit $LASTEXITCODE)" -ForegroundColor Yellow
     Write-Event 'FAIL' "$Id (exit $LASTEXITCODE)"
-    $script:Failed += $Id
+    $Failed.Add($Id)
 }
 
 function Invoke-Child {
@@ -66,26 +207,42 @@ function Invoke-Child {
 }
 
 function Invoke-Tool {
-    param([string]$Name, [string]$Command)
+    # Runs a tweak tool in its own window. -Command fetches an unpinned script; -PinnedScript is
+    # @{ Uri; Sha256; Arguments } for a script checked against its pin before it runs.
+    param([string]$Step, [string]$Name, [string]$Command, [hashtable]$PinnedScript)
     Write-Host ""
     Write-Host "  Tool: $Name" -ForegroundColor White
-    if ((Read-Host "  Run it? Type y (anything else skips)") -notmatch '^(y|yes)$') {
-        Write-Host "    skipped $Name" -ForegroundColor DarkGray; Write-Event 'SKIP' "$Name skipped by user"; return
+    if (-not (Confirm-Step $Step "  Run it?")) {
+        Write-Host "    skipped $Name" -ForegroundColor DarkGray; Write-Event 'SKIP' "$Name skipped"; return
     }
-    Write-Host "    launching in a new window - this window's output is preserved..." -ForegroundColor DarkGray
-    $full = "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; $Command"
-    $enc  = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($full))
-    $proc = Start-Process powershell -PassThru -Wait -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$enc)
-    if ($proc.ExitCode -ne 0) { Write-Host "    $Name reported exit $($proc.ExitCode)" -ForegroundColor Yellow; Write-Event 'FAIL' "$Name (exit $($proc.ExitCode))"; $script:Failed += "$Name (external)" }
-    else { Write-Event 'OK' "$Name completed" }
+    $staged = $null
+    try {
+        if ($PinnedScript) {
+            $staged = Save-VerifiedDownload -Uri $PinnedScript.Uri -Sha256 $PinnedScript.Sha256 -FileName 'setup.ps1'
+            $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $staged)) + $PinnedScript.Arguments
+        } else {
+            $full = "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; $Command"
+            $enc  = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($full))
+            $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $enc)
+        }
+        Write-Host "    launching in a new window - this window's output is preserved..." -ForegroundColor DarkGray
+        $proc = Start-Process powershell -PassThru -Wait -ArgumentList $arguments
+        if ($proc.ExitCode -ne 0) { Write-Host "    $Name reported exit $($proc.ExitCode)" -ForegroundColor Yellow; Write-Event 'FAIL' "$Name (exit $($proc.ExitCode))"; $Failed.Add("$Name (external)") }
+        else { Write-Event 'OK' "$Name completed" }
+    } catch {
+        Write-Host "    $Name not run: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Event 'FAIL' "$Name - $($_.Exception.Message)"
+        $Failed.Add($Name)
+    } finally {
+        Remove-StagedFile $staged
+    }
 }
 
 
 function New-SetupRestorePoint {
     [CmdletBinding(SupportsShouldProcess)]
     param([string]$Description)
-    # System Restore checkpoint. Enables protection if off and lifts the 24h throttle so both
-    # points get created, then restores it. Best-effort.
+    # Best effort. Lifts the 24h creation throttle so both restore points get created, then restores it.
     $srKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
     if (-not $PSCmdlet.ShouldProcess($env:COMPUTERNAME, "create System Restore point '$Description'")) { return }
     try {
@@ -108,7 +265,6 @@ function New-SetupRestorePoint {
         Write-Host "    restore point failed: $($_.Exception.Message)" -ForegroundColor Yellow
         Write-Event 'WARN' "restore point '$Description' failed: $($_.Exception.Message)"
     } finally {
-        # put the 24h throttle back the way we found it
         if ($hadFreq) { Set-ItemProperty $srKey -Name SystemRestorePointCreationFrequency -Value $prevFreq -Type DWord -ErrorAction SilentlyContinue }
         else          { Remove-ItemProperty $srKey -Name SystemRestorePointCreationFrequency -ErrorAction SilentlyContinue }
     }
@@ -205,8 +361,7 @@ $winget = @(
 Write-Host "`n=== winget apps ($($winget.Count)) ===" -ForegroundColor Magenta
 foreach ($pkg in $winget) { Install-App $pkg }
 
-# CUDA toolkit: several GB, and it does nothing without an NVIDIA GPU. Gate it on the
-# hardware rather than shipping that download to every machine that runs this script.
+# CUDA is several GB and useless without an NVIDIA GPU, so it is gated on the hardware.
 Write-Host "`n=== CUDA toolkit (NVIDIA GPU only) ===" -ForegroundColor Magenta
 $nvidiaGpu = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -match '(?i)nvidia' -or $_.AdapterCompatibility -match '(?i)nvidia' })
@@ -218,23 +373,14 @@ if ($nvidiaGpu.Count -gt 0) {
     Write-Event 'SKIP' 'Nvidia.CUDA skipped - no NVIDIA GPU present'
 }
 
-# MSYS2 installs to <SystemDrive>\msys64 via the Qt installer, which returns exit 1 when that
-# directory already exists. winget can't correlate the existing install to the package either,
-# so a plain Install-App retries (and "fails" with 0x8A150006) on every re-run.
-# The drive comes from $env:SystemDrive rather than a literal C: - the default is C:\msys64 on
-# almost every machine, but not on one where Windows lives elsewhere.
+# The MSYS2 installer exits 1 when <SystemDrive>\msys64 exists and winget cannot correlate the
+# install, so a plain Install-App would "fail" (0x8A150006) on every re-run.
 $msys2Root = Join-Path "$env:SystemDrive\" 'msys64'
 $msys2Bash = Join-Path $msys2Root 'usr\bin\bash.exe'
 $msys2Pre  = Test-Path $msys2Bash
 if ($msys2Pre) { Write-Host "==> MSYS2.MSYS2" -ForegroundColor Cyan } else { Install-App 'MSYS2.MSYS2' }
-# bash.exe existing is not the same as MSYS2 working. The installer can die partway through with
-# the tree already extracted, so a guard that only tests for the file reports "already installed"
-# on every later run and hides the broken install forever. Run pacman instead.
-#
-# Judged on the OUTPUT, never on $LASTEXITCODE. When bash.exe is blocked from starting at all,
-# PowerShell raises a non-terminating error that sets no exit code and does not enter catch, so
-# $LASTEXITCODE still holds the previous command's - a successful winget - and a blocked MSYS2
-# would be waved through as healthy by the very guard meant to catch it.
+# An interrupted install leaves bash.exe behind, so probe pacman. Judge its output, not
+# $LASTEXITCODE: a blocked bash.exe raises a non-terminating error and sets no exit code.
 $msys2Ok = $false
 $msys2Probe = ''
 if (Test-Path $msys2Bash) {
@@ -246,9 +392,8 @@ if ($msys2Ok) {
         Write-Host "    already installed (skipped; $msys2Root present and pacman answers)" -ForegroundColor DarkGray
         Write-Event 'SKIP' "MSYS2.MSYS2 already installed ($msys2Root)"
     }
-} else {
-    # Both of these were hit on a real machine, and in both cases deleting the folder and
-    # reinstalling is wasted effort - the fresh install dies exactly the same way.
+} elseif (-not $WhatIfPreference) {
+    # For the two known causes below, a reinstall fails the same way, so name the actual fix.
     Write-Host "    MSYS2 does not run from $msys2Root." -ForegroundColor Yellow
     if ($msys2Probe -match '(?i)access is denied|blocked') {
         Write-Host "    bash.exe is blocked from starting. Windows ships its own bash.exe in System32, so" -ForegroundColor Yellow
@@ -265,11 +410,10 @@ if ($msys2Ok) {
         Write-Host "      Remove-Item '$msys2Root' -Recurse -Force" -ForegroundColor Yellow
         Write-Event 'FAIL' "MSYS2 incomplete at $msys2Root (bash/pacman did not run)"
     }
-    if ($Failed -notcontains 'MSYS2.MSYS2') { $Failed += "MSYS2.MSYS2 (does not run - see the note above)" }
+    if ($Failed -notcontains 'MSYS2.MSYS2') { $Failed.Add("MSYS2.MSYS2 (does not run - see the note above)") }
 }
 
-# Tor Browser. The header only goes here in the "already installed" branch - Install-App
-# prints its own, so announcing it up front duplicates the line on every real install.
+# Tor Browser (Install-App prints its own header, so only the skip branch prints one).
 $torExe = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Tor Browser\Browser\firefox.exe'
 if (Test-Path $torExe) {
     Write-Host "==> TorProject.TorBrowser" -ForegroundColor Cyan
@@ -294,16 +438,14 @@ $vsInstaller = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Insta
 $vswhere     = Join-Path $vsInstaller 'vswhere.exe'
 $vsSetup     = Join-Path $vsInstaller 'setup.exe'
 $vcComponent = 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64'
-if (-not (Test-Path $vswhere)) {
+if (Test-WhatIf 'add the VCTools workload to the newest Build Tools install') {
+} elseif (-not (Test-Path $vswhere)) {
     Write-Host "    vswhere not found - BuildTools didn't install; re-run after it does" -ForegroundColor Yellow
     Write-Event 'FAIL' 'VC++ toolset - vswhere missing (BuildTools not installed)'
-    $Failed += 'VC++ toolset (BuildTools missing)'
+    $Failed.Add('VC++ toolset (BuildTools missing)')
 } else {
-    # Which install must carry the toolset: the NEWEST Build Tools, not "any VS product that
-    # happens to have it". Microsoft.VisualStudio.BuildTools is a rolling winget package - when
-    # it moves from 2022 to 2026 winget cannot correlate the old ARP entry and installs the new
-    # one beside it. Asking "-products * -requires VC.Tools" then matches the OLD install, and
-    # the freshly installed one is left a multi-GB shell with no compiler in it.
+    # Target the newest Build Tools: the rolling winget package installs a new year beside the
+    # old one, and "-products * -requires VC.Tools" alone would match the old install.
     $vcHave = @(& $vswhere -products * -requires $vcComponent -property installationPath 2>$null | Where-Object { $_ })
     $btAll  = @(& $vswhere -products 'Microsoft.VisualStudio.Product.BuildTools' -property installationPath 2>$null | Where-Object { $_ })
     $btPath = @(& $vswhere -products 'Microsoft.VisualStudio.Product.BuildTools' -latest -property installationPath 2>$null |
@@ -325,14 +467,14 @@ if (-not (Test-Path $vswhere)) {
     } elseif (-not (Test-Path $vsSetup)) {
         Write-Host "    VS setup.exe not found (skipped)" -ForegroundColor Yellow
         Write-Event 'FAIL' 'VC++ toolset - VS setup.exe missing'
-        $Failed += 'VC++ toolset (setup.exe missing)'
+        $Failed.Add('VC++ toolset (setup.exe missing)')
     } else {
         if (-not $btPath) {
             # No hardcoded path: the BuildTools directory tracks the year (2022 -> 2026 -> ...).
             # If vswhere can't report it, BuildTools isn't ready - re-run after it installs.
             Write-Host "    BuildTools install path not found via vswhere - skipping VCTools (re-run after BuildTools installs)" -ForegroundColor Yellow
             Write-Event 'FAIL' 'VC++ toolset - BuildTools installationPath not found via vswhere'
-            $Failed += 'VC++ toolset (BuildTools path not found)'
+            $Failed.Add('VC++ toolset (BuildTools path not found)')
         } else {
             Write-Host "==> adding VCTools workload to $btPath (compiler + linker + SDK, multi-GB download)" -ForegroundColor Cyan
             # no --wait: installer 4.x rejects it (exit 87); Start-Process -Wait blocks instead.
@@ -343,9 +485,7 @@ if (-not (Test-Path $vswhere)) {
                 '--passive', '--norestart'
             )
             $proc = Start-Process $vsSetup -ArgumentList $vsArgs -Wait -PassThru
-            # trust vswhere over the exit code - it reflects what actually got installed.
-            # Check the install we just modified, not "any product": another VS install that
-            # already had the toolset would otherwise report success for a failed modify.
+            # Trust vswhere over the exit code, and check only the install that was modified.
             $vcNow = @(& $vswhere -products * -requires $vcComponent -property installationPath 2>$null |
                        Where-Object { $_ -and $_.TrimEnd('\') -eq $btPath.TrimEnd('\') })
             if ($vcNow.Count -gt 0) {
@@ -355,7 +495,7 @@ if (-not (Test-Path $vswhere)) {
             } else {
                 Write-Host "    VCTools install failed (exit $($proc.ExitCode)) - component still missing" -ForegroundColor Yellow
                 Write-Event 'FAIL' "VC++ toolset (exit $($proc.ExitCode))"
-                $Failed += 'VC++ toolset (VCTools workload)'
+                $Failed.Add('VC++ toolset (VCTools workload)')
             }
         }
     }
@@ -366,40 +506,46 @@ Install-App '9P7GGFL7DX57' 'msstore'   # Harden System Security
 Install-App '9MSMLRH6LZF3' 'msstore'   # Windows Notepad
 # AppControl Manager (same author): Install-App '9PNG1JDDTGP8' 'msstore'
 
-# Microsoft Office
+# Microsoft 365 Personal/Family: Microsoft's click-to-run bootstrapper, fetched at run time and run only
+# with a valid Microsoft signature. winget's Microsoft.Office is the enterprise product, which a consumer
+# subscription does not activate. Skipped when Word exists, so a second Office product is never added.
 Write-Host "`n=== Microsoft Office ===" -ForegroundColor Magenta
 $word = Join-Path $env:ProgramFiles 'Microsoft Office\root\Office16\WINWORD.EXE'
 if (Test-Path $word) {
+    Write-Host "==> Microsoft 365" -ForegroundColor Cyan
     Write-Host "    already installed (skipped)" -ForegroundColor DarkGray
     Write-Event 'SKIP' 'Microsoft Office already installed'
 } else {
-    $office = Join-Path $env:TEMP 'OfficeSetup.exe'
-    # pinned hash of office/OfficeSetup.exe in this repo; refresh with Get-FileHash if the stub is replaced
-    $officeSha256 = 'C0ED5DC2C0ABBE023684B1B4A4E3229D5E678D2FF30F5C147044D7AFBA88B04E'
-    try {
-        Invoke-WebRequest 'https://github.com/26zl/personal-windows-setup/raw/main/office/OfficeSetup.exe' -OutFile $office -UseBasicParsing -TimeoutSec 300
-        # verify pinned hash + Microsoft's Authenticode signature before running as admin
-        if ((Get-FileHash $office -Algorithm SHA256).Hash -ne $officeSha256) {
-            throw 'SHA256 mismatch - update $officeSha256 if you replaced the stub'
+    Write-Host "==> Microsoft 365 (O365HomePremRetail)" -ForegroundColor Cyan
+    # Office language follows the regional format, the same choice the Office download page makes.
+    $officeLanguage = (Get-Culture).Name.ToLowerInvariant()
+    if ($officeLanguage -notmatch '^[a-z]{2,3}-[a-z]{2,4}$') { $officeLanguage = 'en-us' }
+    $officeUrl = "https://c2rsetup.officeapps.live.com/c2r/download.aspx?ProductreleaseID=O365HomePremRetail&platform=x64&language=$officeLanguage&version=O16GA"
+    if (-not (Test-WhatIf "download Microsoft's Office bootstrapper ($officeLanguage) and run it")) {
+        $officeSetup = $null
+        try {
+            $officeSetup = Join-Path (New-StagingDirectory) 'OfficeSetup.exe'
+            Invoke-WebRequest $officeUrl -OutFile $officeSetup -UseBasicParsing -TimeoutSec 300
+            $sig = Get-AuthenticodeSignature -LiteralPath $officeSetup
+            if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'CN=Microsoft Corporation(,|$)') {
+                throw "signature check failed (status $($sig.Status))"
+            }
+            $officeProc = Start-Process $officeSetup -Wait -PassThru
+            # The bootstrapper can hand off and exit early, so trust the installed binary over the exit code.
+            if (Test-Path $word) {
+                Write-Event 'OK' "Microsoft 365 installed (setup exit $($officeProc.ExitCode))"
+            } else {
+                Write-Host "    Office setup exited ($($officeProc.ExitCode)) but WINWORD.EXE isn't there yet - check manually" -ForegroundColor Yellow
+                Write-Event 'WARN' "Microsoft Office not verified (setup exit $($officeProc.ExitCode))"
+                $Failed.Add('Microsoft Office (verify manually)')
+            }
+        } catch {
+            Write-Host "    Office install failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Event 'FAIL' "Microsoft Office - $($_.Exception.Message)"
+            $Failed.Add('Microsoft Office')
+        } finally {
+            Remove-StagedFile $officeSetup
         }
-        $sig = Get-AuthenticodeSignature $office
-        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'CN=Microsoft Corporation(,|$)') {
-            throw "signature check failed (status $($sig.Status))"
-        }
-        Write-Host "==> running OfficeSetup.exe" -ForegroundColor Cyan
-        $officeProc = Start-Process $office -Wait -PassThru
-        # the stub can hand off and exit early, so trust the installed binary over the exit code
-        if (Test-Path $word) {
-            Write-Event 'OK' "Microsoft Office installed (setup exit $($officeProc.ExitCode))"
-        } else {
-            Write-Host "    Office setup exited ($($officeProc.ExitCode)) but WINWORD.EXE isn't there yet - check manually" -ForegroundColor Yellow
-            Write-Event 'WARN' "Microsoft Office not verified (setup exit $($officeProc.ExitCode))"
-            $Failed += 'Microsoft Office (verify manually)'
-        }
-    } catch {
-        Write-Host "    Office install failed: $($_.Exception.Message)" -ForegroundColor Yellow
-        Write-Event 'FAIL' "Microsoft Office - $($_.Exception.Message)"
-        $Failed += 'Microsoft Office'
     }
 }
 
@@ -418,6 +564,7 @@ foreach ($id in $portables.Keys) {
            Where-Object FullName -like "*$id*" | Select-Object -First 1
     if (-not $exe) { Write-Host "    $id : exe not found (skipped)" -ForegroundColor DarkGray; continue }
     $name = ($id -split '\.')[-1]
+    if (Test-WhatIf "Desktop shortcut $name.lnk -> $($exe.FullName)") { continue }
     $lnk = $shell.CreateShortcut((Join-Path $desktop "$name.lnk"))
     $lnk.TargetPath = $exe.FullName
     $lnk.Save()
@@ -426,7 +573,8 @@ foreach ($id in $portables.Keys) {
 # Sysinternals
 $sysDir = Get-ChildItem $pkgRoot -Directory -ErrorAction SilentlyContinue |
           Where-Object Name -like 'Microsoft.Sysinternals.Suite*' | Select-Object -First 1
-if ($sysDir) {
+if ($sysDir -and (Test-WhatIf "Desktop shortcut Sysinternals.lnk -> $($sysDir.FullName)")) {
+} elseif ($sysDir) {
     $lnk = $shell.CreateShortcut((Join-Path $desktop 'Sysinternals.lnk'))
     $lnk.TargetPath = $sysDir.FullName
     $lnk.Save()
@@ -435,16 +583,14 @@ if ($sysDir) {
     Write-Host "    Sysinternals : folder not found (skipped)" -ForegroundColor DarkGray
 }
 
-# Scoop's installer is fetched from get.scoop.sh and cannot be hash-pinned - upstream
-# changes it. Since it runs elevated, it gets the same y/n gate as the other unpinned
-# third-party scripts rather than running unannounced.
+# Scoop's installer from get.scoop.sh changes upstream and cannot be hash-pinned, so it runs elevated only after a y.
 Write-Host "`n=== Scoop ===" -ForegroundColor Magenta
 if (Get-Command scoop -ErrorAction SilentlyContinue) {
     Write-Host "    already installed" -ForegroundColor DarkGray
     Write-Event 'SKIP' 'Scoop already installed'
-} elseif ((Read-Host "Install Scoop? It runs an unpinned script from get.scoop.sh as Administrator. Type y (anything else skips)") -match '^(y|yes)$') {
+} elseif (Confirm-Step 'Scoop' "Install Scoop? It runs an unpinned script from get.scoop.sh as Administrator.") {
     Invoke-Child "& ([scriptblock]::Create((Invoke-RestMethod https://get.scoop.sh))) -RunAsAdmin"
-    if ($LASTEXITCODE -ne 0) { Write-Host "    Scoop reported exit $LASTEXITCODE" -ForegroundColor Yellow; Write-Event 'FAIL' "Scoop (exit $LASTEXITCODE)"; $Failed += 'Scoop' }
+    if ($LASTEXITCODE -ne 0) { Write-Host "    Scoop reported exit $LASTEXITCODE" -ForegroundColor Yellow; Write-Event 'FAIL' "Scoop (exit $LASTEXITCODE)"; $Failed.Add('Scoop') }
     else { Write-Event 'OK' 'Scoop installed' }
 } else {
     Write-Host "    skipped Scoop" -ForegroundColor DarkGray
@@ -453,14 +599,15 @@ if (Get-Command scoop -ErrorAction SilentlyContinue) {
 
 Write-Host "`n=== pipx ===" -ForegroundColor Magenta
 $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
-if (Get-Command python -ErrorAction SilentlyContinue) {
+if (Test-WhatIf 'python -m pip install --user --upgrade pipx') {
+} elseif (Get-Command python -ErrorAction SilentlyContinue) {
     python -m pip install --user --upgrade pipx
     if ($LASTEXITCODE -eq 0) { python -m pipx ensurepath; Write-Event 'OK' 'pipx installed' }
-    else { Write-Host "    pipx install failed (exit $LASTEXITCODE)" -ForegroundColor Yellow; Write-Event 'FAIL' "pipx (exit $LASTEXITCODE)"; $Failed += 'pipx' }
+    else { Write-Host "    pipx install failed (exit $LASTEXITCODE)" -ForegroundColor Yellow; Write-Event 'FAIL' "pipx (exit $LASTEXITCODE)"; $Failed.Add('pipx') }
 } else {
     Write-Host "    python not on PATH yet - after reboot run: python -m pip install --user pipx" -ForegroundColor Yellow
     Write-Event 'WARN' 'pipx deferred - python not on PATH this run'
-    $Failed += 'pipx (python not found this run)'
+    $Failed.Add('pipx (python not found this run)')
 }
 
 # GitHub sign-in + git identity (opt in). Safe under elevation on Windows (same user).
@@ -469,7 +616,7 @@ $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Env
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     Write-Host "    gh not on PATH yet - after reboot run: gh auth login --web; gh auth setup-git" -ForegroundColor Yellow
     Write-Event 'WARN' 'GitHub sign-in deferred - gh not on PATH this run'
-} elseif ((Read-Host "Sign in to GitHub and set your git identity now? Type y (anything else skips)") -match '^(y|yes)$') {
+} elseif (Confirm-Step 'GitHub' "Sign in to GitHub and set your git identity now?") {
     gh auth status 2>$null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "    opening your browser to log in..." -ForegroundColor DarkGray
@@ -510,24 +657,36 @@ if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     Write-Event 'SKIP' 'GitHub sign-in skipped by user'
 }
 
-# Neovim config: run the repo's install.ps1 (backs up existing, or git pulls). Needs a C compiler.
-Write-Host "`n=== Neovim config ===" -ForegroundColor Magenta
+# Neovim config: 26zl/nvim's install.ps1, pinned to a commit and its content. It clones the
+# config from that repo (backing up an existing one); some plugins need a C compiler.
+Write-Host "`n=== Neovim config (opt in) ===" -ForegroundColor Magenta
 $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
 $nvimCfg = Join-Path $env:LOCALAPPDATA 'nvim'
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-    Write-Host "    git not on PATH yet - after reboot run: irm https://github.com/26zl/nvim/raw/main/install.ps1 | iex" -ForegroundColor Yellow
+    Write-Host "    git not on PATH yet - re-run this script after a reboot to set up the Neovim config" -ForegroundColor Yellow
     Write-Event 'WARN' 'Neovim config deferred - git not on PATH this run'
-    $Failed += 'Neovim config (git not found this run)'
-} else {
-    Invoke-Child "& ([scriptblock]::Create((Invoke-RestMethod https://github.com/26zl/nvim/raw/main/install.ps1)))"
+    $Failed.Add('Neovim config (git not found this run)')
+} elseif (Confirm-Step 'Neovim' "Install the Neovim config from 26zl/nvim (installer pinned to $($nvimInstallerCommit.Substring(0, 7)))?") {
+    $nvimInstaller = $null
+    try {
+        $nvimInstaller = Save-VerifiedDownload -Uri "https://github.com/26zl/nvim/raw/$nvimInstallerCommit/install.ps1" -Sha256 $nvimInstallerSha256 -FileName 'install.ps1'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $nvimInstaller
+    } catch {
+        Write-Host "    Neovim installer not run: $($_.Exception.Message)" -ForegroundColor Yellow
+    } finally {
+        Remove-StagedFile $nvimInstaller
+    }
     if (Test-Path (Join-Path $nvimCfg 'init.lua')) {
         Write-Host "    Neovim config ready -> $nvimCfg (plugins install on first 'nvim' launch)" -ForegroundColor DarkGray
         Write-Event 'OK' 'Neovim config installed via install.ps1'
     } else {
         Write-Host "    Neovim config install failed - see output above" -ForegroundColor Yellow
         Write-Event 'FAIL' 'Neovim config (install.ps1)'
-        $Failed += 'Neovim config'
+        $Failed.Add('Neovim config')
     }
+} else {
+    Write-Host "    skipped Neovim config" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'Neovim config skipped'
 }
 # Same config in WSL Debian (opt in): official Neovim tarball + deps + clone, run as root
 # via a temp /mnt script to avoid wsl.exe arg-quoting issues.
@@ -536,18 +695,19 @@ try { wsl.exe -d Debian -u root -- true 2>$null; $wslReady = ($LASTEXITCODE -eq 
 if (-not $wslReady) {
     Write-Host "    WSL Debian not ready yet (finishes after reboot) - re-run to set up Neovim there, or see the nvim README" -ForegroundColor DarkGray
     Write-Event 'INFO' 'Neovim/WSL skipped - Debian not ready this run'
-} elseif ((Read-Host "Set up the same Neovim in WSL Debian too? Type y (anything else skips)") -match '^(y|yes)$') {
+} elseif (Confirm-Step 'NeovimWsl' "Set up the same Neovim in WSL Debian too?") {
     $wslScript = @'
 set -e
+trap 'rm -f /tmp/nvim.tar.gz' EXIT
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq git curl ripgrep fd-find build-essential unzip ca-certificates >/dev/null
 if ! command -v nvim >/dev/null 2>&1 || ! nvim --version | head -1 | grep -qE 'v0\.(1[1-9]|[2-9][0-9])'; then
-  curl -fsSLo /tmp/nvim.tar.gz https://github.com/neovim/neovim/releases/download/stable/nvim-linux-x86_64.tar.gz
+  curl -fsSLo /tmp/nvim.tar.gz https://github.com/neovim/neovim/releases/download/NVIM_TARBALL_VERSION/nvim-linux-x86_64.tar.gz
+  echo "NVIM_TARBALL_SHA256  /tmp/nvim.tar.gz" | sha256sum -c -
   rm -rf /opt/nvim-linux-x86_64
   tar -C /opt -xzf /tmp/nvim.tar.gz
   ln -sf /opt/nvim-linux-x86_64/bin/nvim /usr/local/bin/nvim
-  rm -f /tmp/nvim.tar.gz
 fi
 command -v fdfind >/dev/null 2>&1 && ln -sf "$(command -v fdfind)" /usr/local/bin/fd || true
 u=$(getent passwd 1000 | cut -d: -f1)
@@ -556,7 +716,7 @@ if [ -n "$u" ] && [ ! -f "$h/.config/nvim/init.lua" ]; then
   runuser -u "$u" -- git clone https://github.com/26zl/nvim "$h/.config/nvim"
 fi
 echo "WSL_NVIM_DONE $(nvim --version | head -1)"
-'@ -replace "`r`n", "`n"
+'@ -replace "`r`n", "`n" -replace 'NVIM_TARBALL_VERSION', $nvimTarballVersion -replace 'NVIM_TARBALL_SHA256', $nvimTarballSha256
     $wslSh = Join-Path $env:TEMP 'wsl-nvim-setup.sh'
     [IO.File]::WriteAllText($wslSh, $wslScript, (New-Object Text.UTF8Encoding($false)))
     $wslPath = '/mnt/' + $wslSh.Substring(0,1).ToLower() + ($wslSh.Substring(2) -replace '\\','/')
@@ -567,7 +727,7 @@ echo "WSL_NVIM_DONE $(nvim --version | head -1)"
     } else {
         Write-Host "    WSL Neovim setup reported exit $LASTEXITCODE" -ForegroundColor Yellow
         Write-Event 'FAIL' "Neovim/WSL setup (exit $LASTEXITCODE)"
-        $Failed += 'Neovim (WSL)'
+        $Failed.Add('Neovim (WSL)')
     }
     Remove-Item $wslSh -ErrorAction SilentlyContinue
 } else {
@@ -581,11 +741,8 @@ if ($osCaption -match 'Home') {
     Write-Event 'SKIP' 'Sandbox + Hyper-V skipped (Windows Home)'
 } else {
     foreach ($f in 'Containers-DisposableClientVM','Microsoft-Hyper-V-All') {
-        # Win32_OptionalFeature reports InstallState as a number (1 = Enabled), so the
-        # comparison holds on any display language. Two alternatives were rejected:
-        # matching dism.exe output against "State : Enabled" breaks on a localized Windows
-        # and re-enables the feature on every run, and Get-WindowsOptionalFeature comes
-        # from the DISM module, which throws "Class not registered" under PowerShell 7.
+        # Win32_OptionalFeature.InstallState is numeric (1 = Enabled), so this works on any display
+        # language and under PowerShell 7, unlike dism.exe text or Get-WindowsOptionalFeature.
         $featureState = $null
         try {
             $optionalFeature = Get-CimInstance -ClassName Win32_OptionalFeature -Filter "Name='$f'" -ErrorAction Stop
@@ -605,6 +762,7 @@ if ($osCaption -match 'Home') {
             Write-Event 'SKIP' "feature $f already enabled"
             continue
         }
+        if (Test-WhatIf "dism /online /enable-feature /featurename:$f /all") { continue }
         dism.exe /online /enable-feature "/featurename:$f" /all /norestart | Out-Null
         if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 3010) {
             Write-Host "    $f enabled (reboot to finish)" -ForegroundColor DarkGray
@@ -612,7 +770,7 @@ if ($osCaption -match 'Home') {
         } else {
             Write-Host "    feature failed: $f (dism exit $LASTEXITCODE)" -ForegroundColor Yellow
             Write-Event 'FAIL' "feature $f (dism exit $LASTEXITCODE)"
-            $Failed += "feature: $f"
+            $Failed.Add("feature: $f")
         }
     }
 }
@@ -623,101 +781,120 @@ $wslDistros = (wsl.exe --list --quiet 2>$null) -replace "`0", '' |
 if ($wslDistros -contains 'Debian') {
     Write-Host "    Debian (WSL) already installed" -ForegroundColor DarkGray
     Write-Event 'SKIP' 'Debian (WSL) already installed'
-} else {
+} elseif (-not (Test-WhatIf 'wsl --install -d Debian')) {
     wsl --install -d Debian
-    if ($LASTEXITCODE -ne 0) { Write-Host "    WSL/Debian returned exit $LASTEXITCODE - verify after reboot: wsl -l -v" -ForegroundColor Yellow; Write-Event 'FAIL' "WSL2/Debian (exit $LASTEXITCODE)"; $Failed += 'WSL2/Debian' }
+    if ($LASTEXITCODE -ne 0) { Write-Host "    WSL/Debian returned exit $LASTEXITCODE - verify after reboot: wsl -l -v" -ForegroundColor Yellow; Write-Event 'FAIL' "WSL2/Debian (exit $LASTEXITCODE)"; $Failed.Add('WSL2/Debian') }
     else { Write-Event 'OK' 'WSL2/Debian install initiated (finishes after reboot)' }
 }
 
-# Verify Sysmon by service state because fetched scripts may not preserve exit codes.
+# Verify Sysmon by service state because the child script's exit code is not the whole story.
 Write-Host "`n=== Sysmon (system activity logging) ===" -ForegroundColor Magenta
-Invoke-Child "& ([scriptblock]::Create((Invoke-RestMethod https://github.com/26zl/personal-windows-setup/raw/main/sysmon/install-sysmon.ps1)))"
-$sysmonSvc = Get-CimInstance Win32_Service -Filter "Name='Sysmon' OR Name='Sysmon64'" -ErrorAction SilentlyContinue |
-             Select-Object -First 1
-if ($null -ne $sysmonSvc -and $sysmonSvc.State -eq 'Running') {
-    Write-Host "    Sysmon running (service $($sysmonSvc.Name))" -ForegroundColor DarkGray
-    Write-Event 'OK' "Sysmon running (service $($sysmonSvc.Name))"
-} else {
-    Write-Host "    Sysmon not running after setup - see output above" -ForegroundColor Yellow
-    Write-Event 'FAIL' 'Sysmon not running after install-sysmon.ps1'
-    $Failed += 'Sysmon'
+if (-not (Test-WhatIf 'run sysmon/install-sysmon.ps1 (install Sysmon or reapply its configuration)')) {
+    $sysmonScript = $null
+    try {
+        $sysmonScript = Resolve-OwnScript 'sysmon/install-sysmon.ps1' $sysmonScriptSha256
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $sysmonScript -RepoRef $RepoRef
+    } catch {
+        Write-Host "    install-sysmon.ps1 not run: $($_.Exception.Message)" -ForegroundColor Yellow
+    } finally {
+        Remove-StagedFile $sysmonScript
+    }
+    $sysmonSvc = Get-CimInstance Win32_Service -Filter "Name='Sysmon' OR Name='Sysmon64'" -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+    if ($null -ne $sysmonSvc -and $sysmonSvc.State -eq 'Running') {
+        Write-Host "    Sysmon running (service $($sysmonSvc.Name))" -ForegroundColor DarkGray
+        Write-Event 'OK' "Sysmon running (service $($sysmonSvc.Name))"
+    } else {
+        Write-Host "    Sysmon not running after setup - see output above" -ForegroundColor Yellow
+        Write-Event 'FAIL' 'Sysmon not running after install-sysmon.ps1'
+        $Failed.Add('Sysmon')
+    }
 }
 
 # ConfigureDefender (AndyFul): Defender settings GUI. Installed + verified only, never auto-run.
 Write-Host "`n=== ConfigureDefender (Defender settings GUI) ===" -ForegroundColor Magenta
-$cdDir = Join-Path $env:LOCALAPPDATA 'windows-setup\tools'
+# Program Files rather than the user profile: it runs elevated, so only administrators may replace it.
+$cdDir = Join-Path $env:ProgramFiles 'ConfigureDefender'
 $cdExe = Join-Path $cdDir 'ConfigureDefender.exe'
 $cdUrl = 'https://github.com/AndyFul/ConfigureDefender/raw/master/ConfigureDefender.exe'
 # pinned hash of AndyFul's signed build; refresh with Get-FileHash if he ships a new one
 $cdSha256 = 'BD7630B6AD94F8ED2024E5E98A24B6FEDBB5F2B8A058B70C8FFEEFE98A7DCCA2'
-# Download to a unique staging file and only move it into place once the hash and the
-# signature both check out. Writing straight to $cdExe would leave a rejected binary at
-# the path the Desktop shortcut from an earlier run already points at.
-$cdStaging = Join-Path $cdDir ("ConfigureDefender.{0}.download" -f [guid]::NewGuid().ToString('N'))
-try {
-    $null = New-Item $cdDir -ItemType Directory -Force
-    Invoke-WebRequest $cdUrl -OutFile $cdStaging -UseBasicParsing -TimeoutSec 300
-    if ((Get-FileHash $cdStaging -Algorithm SHA256).Hash -ne $cdSha256) {
-        throw 'SHA256 mismatch - refresh $cdSha256 if AndyFul published a new build'
+if (-not (Test-WhatIf "install ConfigureDefender to $cdExe and add a Desktop shortcut")) {
+    $cdStaged = $null
+    try {
+        # Verified in the admin-only staging folder, then copied so it takes the Program Files permissions.
+        $cdStaged = Save-VerifiedDownload -Uri $cdUrl -Sha256 $cdSha256 -FileName 'ConfigureDefender.exe'
+        $sig = Get-AuthenticodeSignature $cdStaged
+        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Andrzej Pluta') {
+            throw "signature check failed (status $($sig.Status))"
+        }
+        $null = New-Item $cdDir -ItemType Directory -Force
+        Copy-Item -LiteralPath $cdStaged -Destination $cdExe -Force
+        # A copy in the user profile could be replaced without elevation, so it goes.
+        $cdOld = Join-Path $env:LOCALAPPDATA 'windows-setup\tools\ConfigureDefender.exe'
+        if (Test-Path -LiteralPath $cdOld) { Remove-Item -LiteralPath $cdOld -Force -ErrorAction SilentlyContinue }
+        if (-not $desktop) { $desktop = [Environment]::GetFolderPath('Desktop') }
+        if (-not $shell)   { $shell   = New-Object -ComObject WScript.Shell }
+        $lnk = $shell.CreateShortcut((Join-Path $desktop 'ConfigureDefender.lnk'))
+        $lnk.TargetPath = $cdExe
+        $lnk.Save()
+        Write-Host "    installed (not configured) -> $cdExe" -ForegroundColor DarkGray
+        Write-Host "    Desktop shortcut added; open it and choose a protection level yourself." -ForegroundColor DarkGray
+        Write-Event 'OK' 'ConfigureDefender installed (verified, not configured)'
+    } catch {
+        Write-Host "    ConfigureDefender failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Event 'FAIL' "ConfigureDefender - $($_.Exception.Message)"
+        $Failed.Add('ConfigureDefender')
+    } finally {
+        Remove-StagedFile $cdStaged
     }
-    $sig = Get-AuthenticodeSignature $cdStaging
-    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Andrzej Pluta') {
-        throw "signature check failed (status $($sig.Status))"
-    }
-    Move-Item $cdStaging $cdExe -Force
-    if (-not $desktop) { $desktop = [Environment]::GetFolderPath('Desktop') }
-    if (-not $shell)   { $shell   = New-Object -ComObject WScript.Shell }
-    $lnk = $shell.CreateShortcut((Join-Path $desktop 'ConfigureDefender.lnk'))
-    $lnk.TargetPath = $cdExe
-    $lnk.Save()
-    Write-Host "    installed (not configured) -> $cdExe" -ForegroundColor DarkGray
-    Write-Host "    Desktop shortcut added; open it and choose a protection level yourself." -ForegroundColor DarkGray
-    Write-Event 'OK' 'ConfigureDefender installed (verified, not configured)'
-} catch {
-    Write-Host "    ConfigureDefender failed: $($_.Exception.Message)" -ForegroundColor Yellow
-    Write-Event 'FAIL' "ConfigureDefender - $($_.Exception.Message)"
-    $Failed += 'ConfigureDefender'
-} finally {
-    # never leave a rejected or half-written download on disk
-    if (Test-Path $cdStaging) { Remove-Item $cdStaging -Force -ErrorAction SilentlyContinue }
 }
 
 # Optional hardening pass: the settings Harden System Security and ConfigureDefender leave
 # alone. Its own prompts drive it - read-only until each change is confirmed there.
 Write-Host "`n=== Optional hardening (opt in) ===" -ForegroundColor Magenta
-Write-Host "Five ASR rules to Block, NetBIOS off, AutoPlay off, NTLMv2-only, hidden admin shares off, Defender exclusion audit." -ForegroundColor DarkGray
+Write-Host "Five ASR rules to Block, NetBIOS off, AutoPlay off, NTLMv2-only, hidden admin shares off, quarantine retention, Defender exclusion review." -ForegroundColor DarkGray
 Write-Host "It reports the current state first and asks before every single change." -ForegroundColor DarkGray
-if ((Read-Host "Run the optional hardening pass? Type y (anything else skips)") -match '^(y|yes)$') {
-    Invoke-Child "& ([scriptblock]::Create((Invoke-RestMethod https://github.com/26zl/personal-windows-setup/raw/main/hardening/harden-extras.ps1)))"
-    Write-Event 'INFO' 'optional hardening pass ran (its own prompts decided what was applied)'
+if (Confirm-Step 'Hardening' "Run the optional hardening pass?") {
+    $hardenScript = $null
+    try {
+        $hardenScript = Resolve-OwnScript 'hardening/harden-extras.ps1' $hardenScriptSha256
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $hardenScript
+        Write-Event 'INFO' 'optional hardening pass ran (its own prompts decided what was applied)'
+    } catch {
+        Write-Host "    hardening pass not run: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Event 'FAIL' "hardening pass - $($_.Exception.Message)"
+        $Failed.Add('Hardening pass')
+    } finally {
+        Remove-StagedFile $hardenScript
+    }
 } else {
     Write-Host "    skipped optional hardening" -ForegroundColor DarkGray
     Write-Event 'SKIP' 'optional hardening skipped by user'
 }
 
 # Claude Code - the native installer keeps itself updated, so only run it when claude is missing.
-Write-Host "`n=== Claude Code (official native installer) ===" -ForegroundColor Magenta
+Write-Host "`n=== Claude Code (official native installer, opt in) ===" -ForegroundColor Magenta
 $claudeExe = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
 if ((Get-Command claude -ErrorAction SilentlyContinue) -or (Test-Path $claudeExe)) {
     Write-Host "    already installed (skipped; it self-updates)" -ForegroundColor DarkGray
     Write-Event 'SKIP' 'Claude Code already installed'
-} else {
+} elseif (Confirm-Step 'ClaudeCode' "Install Claude Code? Its installer (claude.ai/install.ps1) changes upstream, cannot be pinned and runs as Administrator.") {
     Invoke-Child "& ([scriptblock]::Create((Invoke-RestMethod https://claude.ai/install.ps1)))"
-    if ($LASTEXITCODE -ne 0) { Write-Host "    Claude Code reported exit $LASTEXITCODE" -ForegroundColor Yellow; Write-Event 'FAIL' "Claude Code (exit $LASTEXITCODE)"; $Failed += 'Claude Code' }
+    if ($LASTEXITCODE -ne 0) { Write-Host "    Claude Code reported exit $LASTEXITCODE" -ForegroundColor Yellow; Write-Event 'FAIL' "Claude Code (exit $LASTEXITCODE)"; $Failed.Add('Claude Code') }
     else { Write-Event 'OK' 'Claude Code installed (native installer)' }
+} else {
+    Write-Host "    skipped Claude Code" -ForegroundColor DarkGray
+    Write-Event 'SKIP' 'Claude Code skipped'
 }
 
 # System integrity: DISM first (repairs the component store), then SFC (uses it).
 Write-Host "`n=== System integrity (DISM + SFC) ===" -ForegroundColor Magenta
+if (-not (Test-WhatIf 'DISM ScanHealth, RestoreHealth when corruption is found, then sfc /scannow')) {
 Write-Host "==> ScanHealth (checking the component store - can take a few minutes)" -ForegroundColor Cyan
-# Repair-WindowsImage rather than dism.exe: it returns ImageHealthState as an enum
-# (Healthy / Repairable / NonRepairable), so the result does not depend on the display
-# language. Matching dism.exe output against "No component store corruption detected"
-# fails on every non-English Windows and would send those machines into RestoreHealth
-# on every single run.
-# The catch: DISM is a Windows PowerShell module and throws "Class not registered" under
-# PowerShell 7, so the cmdlet existing says nothing about it working. Try it in-process,
-# then through Windows PowerShell, and only then fall back to reading dism.exe text.
+# Repair-WindowsImage returns ImageHealthState as an enum, independent of display language.
+# The DISM module can throw "Class not registered" under PowerShell 7, so try it in-process,
+# then through Windows PowerShell, and only then fall back to dism.exe text.
 $storeHealthy = $false
 $scanReported = $false
 $scanState = $null
@@ -725,8 +902,6 @@ try {
     $scanState = [string](Repair-WindowsImage -Online -ScanHealth -ErrorAction Stop).ImageHealthState
 }
 catch {
-    # Trim the message: the DISM error arrives with a trailing newline, which otherwise
-    # closes the parenthesis on its own line.
     Write-Host "    Repair-WindowsImage unavailable here ($(($_.Exception.Message -replace '\s+', ' ').Trim()))" -ForegroundColor DarkGray
     $winPs = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (Test-Path $winPs) {
@@ -766,7 +941,7 @@ if ($storeHealthy) {
     } else {
         Write-Host "    DISM RestoreHealth exit $LASTEXITCODE - see %WINDIR%\Logs\DISM\dism.log" -ForegroundColor Yellow
         Write-Event 'FAIL' "DISM RestoreHealth (exit $LASTEXITCODE)"
-        $Failed += 'DISM RestoreHealth'
+        $Failed.Add('DISM RestoreHealth')
     }
 }
 Write-Host "==> sfc /scannow (verifying system files)" -ForegroundColor Cyan
@@ -779,33 +954,36 @@ if ($sfcExit -eq 0) {
     Write-Host "    sfc /scannow exit $sfcExit - review %WINDIR%\Logs\CBS\CBS.log if it could not fix a file" -ForegroundColor Yellow
     Write-Event 'WARN' "sfc /scannow (exit $sfcExit)"
 }
+}   # end of the -WhatIf guard around DISM + SFC
 
 # Dual-boot checks & tweaks (opt in). Read-only report first, then each change is its own y/n.
 Write-Host "`n=== Dual-boot checks & tweaks (opt in) ===" -ForegroundColor Magenta
-if ((Read-Host "Check dual-boot settings? Type y (anything else skips)") -match '^(y|yes)$') {
+if (Confirm-Step 'DualBoot' "Check dual-boot settings?") {
     $powerKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'
     $tzKey    = 'HKLM:\SYSTEM\CurrentControlSet\Control\TimeZoneInformation'
     $hiberboot    = (Get-ItemProperty $powerKey -Name HiberbootEnabled -ErrorAction SilentlyContinue).HiberbootEnabled
     $hiberEnabled = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' -Name HibernateEnabled -ErrorAction SilentlyContinue).HibernateEnabled
     $rtcUtc       = (Get-ItemProperty $tzKey -Name RealTimeIsUniversal -ErrorAction SilentlyContinue).RealTimeIsUniversal
 
-    # boot store: how many Windows OS loaders, plus non-Windows firmware boot entries.
-    # The Windows Recovery Environment is an osloader entry too, but it boots from a ramdisk
-    # rather than from an installed Windows. Counting it reports "2 Windows installs" on an
-    # ordinary single-boot machine, so split the output into entries and drop the ramdisk ones.
-    $osloaderBlocks = @((bcdedit /enum osloader 2>$null | Out-String) -split '(?:\r?\n){2,}' |
-                        Where-Object { $_ -match '(?im)^\s*identifier\s+' })
-    $winLoaders = @($osloaderBlocks | Where-Object { $_ -notmatch '(?im)^\s*device\s+ramdisk' }).Count
-    $recoveryLoaders = $osloaderBlocks.Count - $winLoaders
-    $fwDescs = [regex]::Matches((bcdedit /enum firmware 2>$null | Out-String), '(?im)^\s*description\s+(.+?)\s*$') |
-               ForEach-Object { $_.Groups[1].Value.Trim() } |
-               Where-Object { $_ -and $_ -notmatch '^Windows Boot Manager$' } | Select-Object -Unique
+    # The BCD store read from the registry, because bcdedit translates its labels. Object type
+    # 0x10200003 is a Windows OS loader (WinRE is one too, flagged winpe); 0x101fffff is a firmware entry.
+    $bcdObjects = @(Get-ChildItem -LiteralPath 'HKLM:\BCD00000000\Objects' -ErrorAction SilentlyContinue | ForEach-Object {
+            $elements = Join-Path $_.PSPath 'Elements'
+            [pscustomobject]@{
+                Type        = (Get-ItemProperty -LiteralPath (Join-Path $_.PSPath 'Description') -Name Type -ErrorAction SilentlyContinue).Type
+                Description = [string](Get-ItemProperty -LiteralPath (Join-Path $elements '12000004') -Name Element -ErrorAction SilentlyContinue).Element
+                WinPE       = @((Get-ItemProperty -LiteralPath (Join-Path $elements '26000022') -Name Element -ErrorAction SilentlyContinue).Element) -contains 1
+            }
+        })
+    $osLoaders       = @($bcdObjects | Where-Object { $_.Type -eq 0x10200003 })
+    $winLoaders      = @($osLoaders | Where-Object { -not $_.WinPE }).Count
+    $recoveryLoaders = $osLoaders.Count - $winLoaders
+    $fwDescs = @($bcdObjects | Where-Object { $_.Type -eq 0x101fffff -and $_.Description -and $_.Description -notmatch '^Windows Boot Manager$' } |
+                 ForEach-Object { $_.Description.Trim() } | Select-Object -Unique)
 
-    # Is there actually another OS on the metal? A UTC hardware clock is only correct when the
-    # OTHER OS writes UTC as well (Linux/macOS). WSL does not count - it never touches the RTC.
-    # Two independent signals: the firmware boot entries, and the partition type GUIDs on disk.
-    # Word boundaries on the short, ambiguous names: a firmware entry reading "EFI Search
-    # Device" must not be read as Arch Linux and talk the user into a UTC hardware clock.
+    # A UTC hardware clock is only right when another OS on the metal (Linux/macOS, not WSL)
+    # writes UTC. Two signals: firmware boot entries and partition type GUIDs. Short names
+    # use word boundaries so an entry like "EFI Search Device" is not read as Arch Linux.
     $otherOsPattern = '(?i)ubuntu|debian|fedora|linux|grub|shim|refind|opensuse|manjaro|\barch\b|\bmint\b|pop.?os|nixos|zorin|endeavour|garuda|elementary|kali|centos|\brocky\b|\balma\b|gentoo|macos|clover|opencore'
     $otherOsBoot = @($fwDescs | Where-Object { $_ -match $otherOsPattern })
     # Linux filesystem/root/swap/LVM/RAID and Apple HFS+/APFS partition types.
@@ -829,7 +1007,8 @@ if ((Read-Host "Check dual-boot settings? Type y (anything else skips)") -match 
     $blOn = try { @(Get-BitLockerVolume -ErrorAction Stop | Where-Object { $_.ProtectionStatus -eq 'On' }).Count } catch { 0 }
 
     Write-Host "  --- current state ---" -ForegroundColor White
-    Write-Host ("  Windows installs in boot store : {0}{1}" -f $winLoaders, $(if ($recoveryLoaders -gt 0) { " (plus $recoveryLoaders recovery entry/entries, not counted)" })) -ForegroundColor Gray
+    if ($bcdObjects.Count -eq 0) { Write-Host "  Windows installs in boot store : unknown (the BCD store could not be read)" -ForegroundColor Yellow }
+    else { Write-Host ("  Windows installs in boot store : {0}{1}" -f $winLoaders, $(if ($recoveryLoaders -gt 0) { " (plus $recoveryLoaders recovery entry/entries, not counted)" })) -ForegroundColor Gray }
     if ($fwDescs) { Write-Host ("  Other firmware boot entries    : {0}" -f ($fwDescs -join ', ')) -ForegroundColor Gray }
     else          { Write-Host  "  Other firmware boot entries    : none (only Windows Boot Manager)" -ForegroundColor Gray }
     Write-Host ("  Other OS on the metal          : {0}" -f $(if ($otherOsFound) { "yes - $($otherOsWhy -join '; ')" } else { 'none found (WSL does not count - it never touches the RTC)' })) -ForegroundColor Gray
@@ -852,7 +1031,7 @@ if ((Read-Host "Check dual-boot settings? Type y (anything else skips)") -match 
     if ($hiberEnabled -ne 0) {
         $offered = $true
         Write-Host "  Turning hibernation off also removes Fast Startup and frees a RAM-sized hiberfil.sys. Keep it only if you use Hibernate/sleep-to-disk." -ForegroundColor DarkGray
-        if ((Read-Host "  Disable hibernation entirely? (powercfg /h off) Type y") -match '^(y|yes)$') {
+        if (Confirm-Step 'Hibernation' "  Disable hibernation entirely? (powercfg /h off)") {
             powercfg.exe /hibernate off
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "    hibernation disabled (hiberfil.sys removed; Fast Startup off too)" -ForegroundColor DarkGray
@@ -863,14 +1042,11 @@ if ((Read-Host "Check dual-boot settings? Type y (anything else skips)") -match 
             }
         } else { Write-Event 'SKIP' 'dual-boot: hibernation left enabled' }
     }
-    # RTC as UTC - only right when the OTHER OS on the metal uses UTC (Linux/macOS), never for
-    # Windows + Windows and never on a single-boot machine. The question is therefore gated on
-    # $otherOsFound instead of being asked on every run with a warning line above it: a printed
-    # caveat is not a guard, and answering y without a Linux install only skews the BIOS clock.
+    # Only offered when Linux/macOS was found; on any other machine UTC only skews the firmware clock.
     if ($rtcUtc -ne 1 -and $otherOsFound) {
         $offered = $true
         Write-Host "  Linux/macOS found on this machine, and it expects the hardware clock in UTC." -ForegroundColor DarkGray
-        if ((Read-Host "  Set hardware clock to UTC? Type y") -match '^(y|yes)$') {
+        if (Confirm-Step 'RtcUtc' "  Set hardware clock to UTC?") {
             Set-ItemProperty $tzKey -Name RealTimeIsUniversal -Value 1 -Type DWord
             Write-Host "    RealTimeIsUniversal=1 (Windows now reads the RTC as UTC)" -ForegroundColor DarkGray
             Write-Event 'OK' 'dual-boot: RTC set to UTC'
@@ -880,7 +1056,7 @@ if ((Read-Host "Check dual-boot settings? Type y (anything else skips)") -match 
         $offered = $true
         Write-Host "  RealTimeIsUniversal=1 is set, but no Linux/macOS install was found. On a Windows-only" -ForegroundColor DarkGray
         Write-Host "  machine that only offsets the firmware clock and anything reading the RTC directly." -ForegroundColor DarkGray
-        if ((Read-Host "  Put the hardware clock back to local time? Type y") -match '^(y|yes)$') {
+        if (Confirm-Step 'RtcLocal' "  Put the hardware clock back to local time?") {
             Remove-ItemProperty $tzKey -Name RealTimeIsUniversal -ErrorAction SilentlyContinue
             w32tm /resync 2>&1 | Out-Null   # best effort: pull the correct time straight back
             Write-Host "    RealTimeIsUniversal removed (Windows reads the RTC as local time again)" -ForegroundColor DarkGray
@@ -900,7 +1076,7 @@ if ((Read-Host "Check dual-boot settings? Type y (anything else skips)") -match 
 
 # Update installed apps (opt in)
 Write-Host "`n=== Update installed apps (opt in) ===" -ForegroundColor Magenta
-if ((Read-Host "Update all installed apps now? (winget upgrade --all) Type y (anything else skips)") -match '^(y|yes)$') {
+if (Confirm-Step 'Upgrade' "Update all installed apps now? (winget upgrade --all)") {
     winget upgrade --all --silent --accept-source-agreements --accept-package-agreements
     if ($LASTEXITCODE -ne 0) { Write-Host "    some upgrades reported issues (exit $LASTEXITCODE)" -ForegroundColor DarkGray }
     Write-Event 'INFO' "winget upgrade --all finished (exit $LASTEXITCODE)"
@@ -909,15 +1085,11 @@ if ((Read-Host "Update all installed apps now? (winget upgrade --all) Type y (an
     Write-Event 'SKIP' 'winget upgrade --all skipped by user'
 }
 
-# Disk cleanup: superseded components, Windows Update cache, temp folders, Recycle Bin.
-# Opt in, because none of it can be undone. Emptying the Recycle Bin destroys whatever the
-# user has deleted but not yet decided about, and clearing TEMP takes installer payloads,
-# half-finished downloads and application scratch files with it. System Restore does not
-# bring any of that back - it only covers system files, the registry and program installs.
+# Disk cleanup is opt in: none of it can be undone, and System Restore does not bring it back.
 Write-Host "`n=== Disk cleanup (opt in) ===" -ForegroundColor Magenta
 Write-Host "Removes superseded update components, the Windows Update download cache, both TEMP" -ForegroundColor DarkGray
 Write-Host "folders and the Recycle Bin. None of it can be undone - files in the Recycle Bin are gone." -ForegroundColor DarkGray
-if ((Read-Host "Run disk cleanup now? Type y (anything else skips)") -match '^(y|yes)$') {
+if (Confirm-Step 'DiskCleanup' "Run disk cleanup now?") {
     $freeBefore = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'").FreeSpace
     # 1) component store: drop superseded update payloads
     Write-Host "==> DISM /StartComponentCleanup" -ForegroundColor Cyan
@@ -925,10 +1097,7 @@ if ((Read-Host "Run disk cleanup now? Type y (anything else skips)") -match '^(y
     if ($LASTEXITCODE -ne 0) { Write-Host "    component cleanup exit $LASTEXITCODE (continuing)" -ForegroundColor DarkGray }
     # 2) Windows Update download cache
     Write-Host "==> Windows Update cache" -ForegroundColor Cyan
-    # Record what wuauserv looked like first and put it back that way. Starting it
-    # unconditionally would silently re-enable Windows Update on a machine where it had
-    # deliberately been stopped or disabled - the cleanup would be changing something the
-    # user never asked it to touch.
+    # Restart wuauserv only if this step stopped it, never one that was deliberately stopped.
     $wuWasRunning = $false
     $wuStopped = $false
     try {
@@ -943,7 +1112,6 @@ if ((Read-Host "Run disk cleanup now? Type y (anything else skips)") -match '^(y
     } catch {
         Write-Host "    update-cache step skipped ($($_.Exception.Message))" -ForegroundColor DarkGray
     } finally {
-        # Only restart it if this script is what stopped it.
         if ($wuStopped) {
             try { Start-Service wuauserv -ErrorAction Stop }
             catch { Write-Host "    could not restart wuauserv - start it in services.msc" -ForegroundColor Yellow }
@@ -970,10 +1138,15 @@ if ((Read-Host "Run disk cleanup now? Type y (anything else skips)") -match '^(y
 # External tweak tools
 Write-Host "`n=== External tweak tools (opt in) ===" -ForegroundColor Magenta
 Write-Host "Optional. Each runs in its own new window, so it can't clear or overwrite this one." -ForegroundColor DarkGray
-if ((Read-Host "Configure any tweak tools? Type y to choose them one by one (anything else skips all)") -match '^(y|yes)$') {
-    Invoke-Tool 'Win11Debloat (Raphire)' "& ([scriptblock]::Create((Invoke-RestMethod 'https://debloat.raphi.re/')))"
-    Invoke-Tool 'Winhance'               "& ([scriptblock]::Create((Invoke-RestMethod 'https://get.winhance.net')))"
-    Invoke-Tool 'PowerShellPerfect (your profile)' "& ([scriptblock]::Create((Invoke-RestMethod 'https://github.com/26zl/PowerShellPerfect/raw/main/setup.ps1'))) -SkipHashCheck"
+if (Confirm-Step 'TweakTools' "Configure any tweak tools? You choose them one by one.") {
+    # Win11Debloat and Winhance serve their latest release and cannot be pinned.
+    Invoke-Tool -Step 'Win11Debloat' -Name 'Win11Debloat (Raphire, unpinned)' -Command "& ([scriptblock]::Create((Invoke-RestMethod 'https://debloat.raphi.re/')))"
+    Invoke-Tool -Step 'Winhance' -Name 'Winhance (unpinned)' -Command "& ([scriptblock]::Create((Invoke-RestMethod 'https://get.winhance.net')))"
+    Invoke-Tool -Step 'PowerShellPerfect' -Name "PowerShellPerfect (your profile, pinned to $($pspCommit.Substring(0, 7)))" -PinnedScript @{
+        Uri       = "https://github.com/26zl/PowerShellPerfect/raw/$pspCommit/setup.ps1"
+        Sha256    = $pspSetupSha256
+        Arguments = @('-Ref', $pspCommit, '-ExpectedSha256', $pspBundleSha256)
+    }
 } else {
     Write-Host "    skipped all tweak tools" -ForegroundColor DarkGray
     Write-Event 'SKIP' 'all tweak tools skipped'
@@ -985,7 +1158,9 @@ New-SetupRestorePoint "After windows-setup ($stamp)"
 
 # Summary
 Write-Host "`n=====================================================" -ForegroundColor Green
-if ($Failed.Count -eq 0) {
+if ($WhatIfPreference) {
+    Write-Host "Preview only (-WhatIf): nothing was installed or changed." -ForegroundColor Green
+} elseif ($Failed.Count -eq 0) {
     Write-Host "No tracked failures." -ForegroundColor Green
 } else {
     Write-Host "These need a manual look:" -ForegroundColor Yellow
@@ -1002,4 +1177,11 @@ Write-Host "=====================================================" -ForegroundCo
     $tail = if ($Failed.Count) { ": $($Failed -join ', ')" } else { '' }
     Write-Event 'INFO' "run ended after $mins min - $($Failed.Count) tracked failure(s)$tail"
     if ($log) { Stop-Transcript | Out-Null }
+    $ErrorActionPreference = $previousErrorAction
+}
+
+# A failed run ends in an error rather than exit, which would close the window irm | iex ran in.
+if ($Failed.Count -gt 0 -and -not $WhatIfPreference) {
+    $global:LASTEXITCODE = 1
+    throw "windows-setup finished with $($Failed.Count) tracked failure(s): $($Failed -join ', ')"
 }

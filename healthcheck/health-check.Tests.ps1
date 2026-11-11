@@ -65,24 +65,24 @@ Describe 'Read-only guarantee' {
         $ownFunctions += $script:Ast.FindAll(
             { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true).Name
 
+        # File-writing cmdlets (Out-File, Export-Csv, Add-Type's temp compile) are deliberately absent.
         $allowed = @(
             'Write-Host', 'Write-Verbose', 'Write-Debug', 'Write-Output',
-            'Add-Member', 'Add-Type', 'New-Object', 'New-TimeSpan', 'New-PSObject',
-            'Out-String', 'Out-Null', 'Out-File', 'Start-Sleep', 'Set-StrictMode',
-            'Format-Table', 'Format-List', 'Format-Hex', 'Import-Module', 'Export-Csv',
+            'Add-Member', 'New-Object', 'New-TimeSpan', 'New-PSObject',
+            'Out-String', 'Out-Null', 'Start-Sleep', 'Set-StrictMode',
+            'Format-Table', 'Format-List', 'Format-Hex', 'Import-Module',
             # Reads a file and returns objects. State-changing only by verb, not in fact.
-            'Import-Csv'
+            'Import-Csv',
+            # Removes the variables a run added to the caller's PowerShell session, nothing else.
+            'Remove-Variable'
         ) + $ownFunctions
 
         $banned = '^(Set|Remove|New|Start|Stop|Restart|Clear|Disable|Enable|Add|Rename|Move|Copy|Write|Out|Export|Import|Invoke|Register|Unregister|Install|Uninstall|Update|Reset|Suspend|Resume|Push|Pop|Mount|Dismount|Initialize|Format|Repair|Optimize)-'
 
-        # Start-Process and Remove-Item exist for exactly one purpose: running a
-        # third-party audit tool the caller opted into by passing its path, and deleting
-        # the report file that tool writes. Both are confined to the delegation code, and
-        # this test pins them there - a Remove-Item that appears anywhere else is a real
-        # violation of the promise, so the exemption is granted by location, not by name.
+        # Start-Process and Remove-Item only run delegated tools and delete their temporary
+        # files, so they are allowed by location: inside Invoke-ExternalAudit, or in the body
+        # of an "if ($PrivescCheckPath)" / "if ($DeepBlueCliPath)" block.
         $delegationOnly = @('Start-Process', 'Remove-Item')
-        $delegationFunctions = @('Invoke-ExternalAudit', 'Test-SecurityHealth', 'Test-LoggingHealth')
 
         $violations = @()
         foreach ($command in $script:Commands) {
@@ -90,15 +90,24 @@ Describe 'Read-only guarantee' {
             if (-not $name -or $name -notmatch $banned -or $allowed -contains $name) { continue }
 
             if ($delegationOnly -contains $name) {
-                # Which function encloses this call?
-                $enclosing = $script:Functions |
-                    Where-Object {
-                        $_.Extent.StartOffset -le $command.Extent.StartOffset -and
-                        $_.Extent.EndOffset -ge $command.Extent.EndOffset
-                    } |
-                    Sort-Object { $_.Extent.EndOffset - $_.Extent.StartOffset } |
-                    Select-Object -First 1
-                if ($enclosing -and $delegationFunctions -contains $enclosing.Name) { continue }
+                $inDelegation = $false
+                $child = $command
+                for ($node = $command.Parent; $node -and -not $inDelegation; $node = $node.Parent) {
+                    if ($node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                        $node.Name -eq 'Invoke-ExternalAudit') {
+                        $inDelegation = $true
+                    }
+                    elseif ($node -is [System.Management.Automation.Language.IfStatementAst]) {
+                        foreach ($clause in $node.Clauses) {
+                            if ([object]::ReferenceEquals($clause.Item2, $child) -and
+                                $clause.Item1.Extent.Text -match '^\$(PrivescCheckPath|DeepBlueCliPath)$') {
+                                $inDelegation = $true
+                            }
+                        }
+                    }
+                    $child = $node
+                }
+                if ($inDelegation) { continue }
                 $violations += "$name outside the delegation code (line $($command.Extent.StartLineNumber))"
                 continue
             }
@@ -114,6 +123,39 @@ Describe 'Read-only guarantee' {
         # SECURITY.md stops being true.
         $script:Raw | Should -Not -Match '(?i)(DeepBlue|PrivescCheck)[^\r\n]*?(Invoke-WebRequest|Invoke-RestMethod|iwr|irm|DownloadFile|DownloadString|git\s+clone)'
         $script:Raw | Should -Not -Match '(?i)(Invoke-WebRequest|Invoke-RestMethod|DownloadFile|DownloadString)[^\r\n]*?(DeepBlue|PrivescCheck|sans-blue-team|itm4n)'
+    }
+
+    It 'quotes delegation paths with EscapeSingleQuotedStringContent' {
+        # -replace "'", "''" misses the typographic quotes PowerShell also treats as ', so a
+        # crafted path could break out of the quoted string the child process evaluates.
+        $assignments = @($script:Ast.FindAll({
+                    param($n)
+                    $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                    $n.Left.Extent.Text -match '^\$(privesc|deepBlue)Expression$'
+                }, $true))
+        $assignments.Count | Should -Be 2
+        foreach ($assignment in $assignments) {
+            $assignment.Right.Extent.Text | Should -Match 'EscapeSingleQuotedStringContent'
+        }
+
+        $path = 'C:\tools\x' + [char]0x2019 + '; Write-Output owned; ' + [char]0x2019 + '.ps1'
+        $literal = "'" + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($path) + "'"
+        [scriptblock]::Create($literal).Invoke()[0] | Should -BeExactly $path
+    }
+
+    It 'starts processes through .NET only for the winget listing' {
+        # The cmdlet check above cannot see [Diagnostics.Process]::Start, so pin it here.
+        $starts = @($script:Ast.FindAll({
+                    param($n)
+                    $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                    $n.Member.Extent.Text -eq 'Start' -and
+                    $n.Expression.Extent.Text -match 'Diagnostics\.Process\]$'
+                }, $true))
+        $starts.Count | Should -Be 1
+        $enclosing = $starts[0].Parent
+        while ($enclosing -and $enclosing -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $enclosing = $enclosing.Parent }
+        $enclosing.Name | Should -Be 'Get-WingetUpgradeList'
+        $enclosing.Extent.Text | Should -Match "Arguments = 'upgrade --disable-interactivity'"
     }
 
     It 'runs external tools in analysis mode only' {
@@ -233,6 +275,32 @@ Describe 'Format-Size' {
 
     It 'does not crash on zero' {
         { Format-Size -Bytes 0 } | Should -Not -Throw
+    }
+}
+
+Describe 'Report export' {
+    BeforeAll {
+        $fn = $script:Functions | Where-Object Name -eq 'Export-Report'
+        . ([scriptblock]::Create($fn.Extent.Text))
+    }
+
+    It 'writes a relative -ReportPath under the current PowerShell location' {
+        # .NET resolves relative paths against the process directory, which Set-Location does not move.
+        $processDir = Join-Path $TestDrive 'process'
+        $location = Join-Path $TestDrive 'location'
+        $null = New-Item -ItemType Directory -Path $processDir, $location
+        $previous = [Environment]::CurrentDirectory
+        try {
+            [Environment]::CurrentDirectory = $processDir
+            Push-Location -LiteralPath $location
+            Export-Report -Path 'report.md' 6>$null
+            Join-Path $location 'report.md' | Should -Exist
+            Join-Path $processDir 'report.md' | Should -Not -Exist
+        }
+        finally {
+            Pop-Location
+            [Environment]::CurrentDirectory = $previous
+        }
     }
 }
 

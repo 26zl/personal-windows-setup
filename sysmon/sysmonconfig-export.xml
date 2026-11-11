@@ -4,12 +4,12 @@
   Source project:	https://github.com/SwiftOnSecurity/sysmon-config
   Source license:	Creative Commons Attribution 4.0 | You may privatize, fork, edit, teach, publish, or deploy for commercial use - with attribution in the text.
 
-  Fork version:	<N/A>
-  Fork author:	<N/A>
-  Fork project:	<N/A>
-  Fork license:	<N/A>
+  Fork version:	2026-11-11 | schemaversion 4.81, rule groups added in the marked block at the end, include paths made drive-relative
+  Fork author:	26zl
+  Fork project:	https://github.com/26zl/personal-windows-setup (sysmon/sysmonconfig-export.xml; the README lists every change)
+  Fork license:	Creative Commons Attribution 4.0, like the source
 
-  REQUIRED: Sysmon version 13 or higher (due to changes in syntax and bug-fixes)
+  REQUIRED: Sysmon version 14 or higher (schemaversion 4.81, needed for FileDeleteDetected)
 	https://docs.microsoft.com/en-us/sysinternals/downloads/sysmon
 
   NOTE: To collect Sysmon logs centrally for free, see https://aka.ms/WEF | Command to allow log access to the Network Service:

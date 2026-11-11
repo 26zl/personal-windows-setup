@@ -20,13 +20,31 @@
   Re-run this after Harden System Security: it manages some ASR rules through policy and
   can put them back.
 
-  Run this AFTER setup.ps1, not before. setup.ps1 offers this pass at the end of its run for
-  a reason: ASR rules block installers midway without a useful error. Running it first killed
-  the MSYS2 installer partway through its post-install step, leaving a tree on disk that
-  looked complete and a winget exit code that pointed nowhere near the real cause.
+  Run this after setup.ps1, not before: the ASR rules can block installers midway (MSYS2's
+  post-install step is one) without a useful error.
+
+  Nothing is written until the first y. Then, before that change, it creates a System Restore
+  point and starts a record in %LOCALAPPDATA%\windows-setup\logs: a transcript plus
+  hardening-before-*.json and hardening-after-*.json with every value it can change, the full
+  Defender exclusion lists included. A session without a console answers no to every prompt.
 #>
 
-$ErrorActionPreference = 'Continue'
+if ($env:NO_COLOR) {
+    # https://no-color.org: the same output without colours.
+    function Write-Host {
+        [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidOverwritingBuiltInCmdlets', '', Justification = 'Forwards to the real Write-Host without colours when NO_COLOR is set.')]
+        param(
+            [Parameter(Position = 0, ValueFromPipeline, ValueFromRemainingArguments)][object]$Object,
+            [switch]$NoNewline, [object]$Separator,
+            [System.ConsoleColor]$ForegroundColor, [System.ConsoleColor]$BackgroundColor
+        )
+        process {
+            $null = $PSBoundParameters.Remove('ForegroundColor')
+            $null = $PSBoundParameters.Remove('BackgroundColor')
+            Microsoft.PowerShell.Utility\Write-Host @PSBoundParameters
+        }
+    }
+}
 
 # Return instead of exiting because the script is commonly invoked with iex.
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -35,14 +53,15 @@ if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole(
     Write-Host "Run this in an ELEVATED PowerShell (right-click > Run as administrator)." -ForegroundColor Red
     return
 }
+# Restored at the end: with iex this is the caller's own session.
+$previousErrorAction = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 
-# The five ASR rules a stock Harden System Security / ConfigureDefender run tends to leave
-# below Block. The two noisy ones are left out on purpose: prevalence/age
-# (01443614-cd74-433a-b99e-2ecdc07bfc25) buries a dev + gaming box in false positives, and
-# PSExec/WMI (d1e49aac-8f56-4280-b9ba-993a6d77406c) breaks Sysinternals and remote admin work.
-# Two of them are still preview rules at Microsoft, which is said out loud rather than left
-# for the user to discover: a preview rule can change behaviour between Defender platform
-# updates, and those are the two to turn off first if something legitimate starts getting blocked.
+# ASR rules a stock Harden System Security / ConfigureDefender run tends to leave below Block.
+# Left out on purpose: prevalence/age (01443614-cd74-433a-b99e-2ecdc07bfc25) floods a dev and
+# gaming box with false positives, and PSExec/WMI (d1e49aac-8f56-4280-b9ba-993a6d77406c) breaks
+# Sysinternals and remote admin. Preview rules can change between Defender platform updates;
+# turn those off first if something legitimate gets blocked.
 $asrTargets = [ordered]@{
     '56a863a9-875e-4185-98a7-b882c64b5ce5' = 'abuse of exploited vulnerable signed drivers'
     'c0033c00-d16d-4114-a5a0-dc9b3a7d2ceb' = 'copied or impersonated system tools [preview rule]'
@@ -61,8 +80,112 @@ $lanmanKey    = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters
 $quarantinePolicyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Quarantine'
 
 function Confirm-Change {
+    # No console (Read-Host throws) or end of input means no.
     param([string]$Prompt)
-    (Read-Host "  $Prompt Type y (anything else skips)") -match '^(y|yes)$'
+    try { ([string](Read-Host "  $Prompt Type y (anything else skips)")) -match '^(y|yes)$' }
+    catch { $false }
+}
+
+function Get-HardeningState {
+    # Every value this script can change, as plain data for the JSON record.
+    $pref = $null
+    try { $pref = Get-MpPreference -ErrorAction Stop } catch { $pref = $null }
+    $asr = [ordered]@{}
+    if ($pref) {
+        $ids  = @($pref.AttackSurfaceReductionRules_Ids)
+        $acts = @($pref.AttackSurfaceReductionRules_Actions)
+        for ($i = 0; $i -lt $ids.Count; $i++) { if ($ids[$i]) { $asr["$($ids[$i])".ToLower()] = [int]$acts[$i] } }
+    }
+    $asrPolicy = [ordered]@{}
+    $policy = Get-ItemProperty -LiteralPath $asrPolicyKey -ErrorAction SilentlyContinue
+    if ($policy) {
+        foreach ($p in @($policy.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' })) { $asrPolicy[$p.Name] = [string]$p.Value }
+    }
+    $netbios = [ordered]@{}
+    foreach ($iface in @(Get-ChildItem -LiteralPath $netbtKey -ErrorAction SilentlyContinue)) {
+        $netbios[$iface.PSChildName] = (Get-ItemProperty -LiteralPath $iface.PSPath -Name NetbiosOptions -ErrorAction SilentlyContinue).NetbiosOptions
+    }
+    [ordered]@{
+        Time                 = (Get-Date).ToString('o')
+        DefenderAvailable    = [bool]$pref
+        AsrRules             = $asr
+        AsrPolicy            = $asrPolicy
+        ExclusionPath        = @(if ($pref) { $pref.ExclusionPath | Where-Object { $_ } })
+        ExclusionProcess     = @(if ($pref) { $pref.ExclusionProcess | Where-Object { $_ } })
+        ExclusionExtension   = @(if ($pref) { $pref.ExclusionExtension | Where-Object { $_ } })
+        QuarantineDays       = $(if ($pref) { $pref.QuarantinePurgeItemsAfterDelay } else { $null })
+        QuarantinePolicyDays = (Get-ItemProperty -LiteralPath $quarantinePolicyKey -Name PurgeItemsAfterDelay -ErrorAction SilentlyContinue).PurgeItemsAfterDelay
+        NetbiosOptions       = $netbios
+        NoDriveTypeAutoRun   = (Get-ItemProperty -LiteralPath $explorerKey -Name NoDriveTypeAutoRun -ErrorAction SilentlyContinue).NoDriveTypeAutoRun
+        NoAutorun            = (Get-ItemProperty -LiteralPath $explorerKey -Name NoAutorun -ErrorAction SilentlyContinue).NoAutorun
+        LmCompatibilityLevel = (Get-ItemProperty -LiteralPath $lsaKey -Name LmCompatibilityLevel -ErrorAction SilentlyContinue).LmCompatibilityLevel
+        AutoShareWks         = (Get-ItemProperty -LiteralPath $lanmanKey -Name AutoShareWks -ErrorAction SilentlyContinue).AutoShareWks
+        AutoShareServer      = (Get-ItemProperty -LiteralPath $lanmanKey -Name AutoShareServer -ErrorAction SilentlyContinue).AutoShareServer
+        Shares               = @(Get-SmbShare -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    }
+}
+
+function New-HardeningRestorePoint {
+    # Same logic as setup.ps1: lift the 24h creation throttle, create the point, put the throttle back.
+    [CmdletBinding(SupportsShouldProcess)]
+    param([string]$Description)
+    $srKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
+    if (-not $PSCmdlet.ShouldProcess($env:COMPUTERNAME, "create System Restore point '$Description'")) { return }
+    try {
+        Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction Stop
+    } catch {
+        Write-Host "    could not enable System Protection: $($_.Exception.Message)" -ForegroundColor Yellow
+        return
+    }
+    $hadFreq  = $false
+    $prevFreq = $null
+    try {
+        $existing = Get-ItemProperty $srKey -Name SystemRestorePointCreationFrequency -ErrorAction SilentlyContinue
+        if ($null -ne $existing) { $hadFreq = $true; $prevFreq = $existing.SystemRestorePointCreationFrequency }
+        Set-ItemProperty $srKey -Name SystemRestorePointCreationFrequency -Value 0 -Type DWord -ErrorAction SilentlyContinue
+        Checkpoint-Computer -Description $Description -RestorePointType 'MODIFY_SETTINGS' -ErrorAction Stop
+        Write-Host "    restore point created: $Description" -ForegroundColor DarkGray
+    } catch {
+        Write-Host "    restore point failed: $($_.Exception.Message)" -ForegroundColor Yellow
+    } finally {
+        if ($hadFreq) { Set-ItemProperty $srKey -Name SystemRestorePointCreationFrequency -Value $prevFreq -Type DWord -ErrorAction SilentlyContinue }
+        else          { Remove-ItemProperty $srKey -Name SystemRestorePointCreationFrequency -ErrorAction SilentlyContinue }
+    }
+}
+
+$script:ChangeRecord = $null
+function Start-ChangeRecord {
+    # Runs once, right before the first change the user confirmed.
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    if ($script:ChangeRecord -or -not $PSCmdlet.ShouldProcess('change record and restore point', 'start')) { return }
+    $dir   = Join-Path $env:LOCALAPPDATA 'windows-setup\logs'
+    $stamp = '{0:yyyyMMdd-HHmmss}' -f (Get-Date)
+    $script:ChangeRecord = [ordered]@{
+        Transcript = Join-Path $dir "hardening-transcript-$stamp.log"
+        Before     = Join-Path $dir "hardening-before-$stamp.json"
+        After      = Join-Path $dir "hardening-after-$stamp.json"
+    }
+    try {
+        $null = New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop
+        # Keep 90 days of hardening records.
+        Get-ChildItem -LiteralPath $dir -File -Filter 'hardening-*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-90) } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        Start-Transcript -Path $script:ChangeRecord.Transcript -Append | Out-Null
+        [IO.File]::WriteAllText($script:ChangeRecord.Before, ((Get-HardeningState) | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false)))
+        Write-Host "    values before the change saved to $($script:ChangeRecord.Before)" -ForegroundColor DarkGray
+    } catch {
+        Write-Host "    could not write the change record: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+    New-HardeningRestorePoint "Before harden-extras ($stamp)"
+}
+
+function Save-ChangeRecord {
+    # Rewritten after every applied change, so it always holds the latest values.
+    if (-not $script:ChangeRecord) { return }
+    try { [IO.File]::WriteAllText($script:ChangeRecord.After, ((Get-HardeningState) | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false))) }
+    catch { Write-Host "    could not write $($script:ChangeRecord.After): $($_.Exception.Message)" -ForegroundColor Yellow }
 }
 
 function Get-AsrState {
@@ -101,7 +224,7 @@ $mp = $null
 try { $mp = Get-MpPreference -ErrorAction Stop }
 catch { Write-Host "  Defender is not managing this machine - ASR and exclusion items are skipped." -ForegroundColor Yellow }
 
-# --- read-only report -------------------------------------------------------------------
+# Read-only report
 $asrState   = if ($mp) { Get-AsrState } else { @{} }
 $asrPending = @($asrTargets.Keys | Where-Object { $asrState[$_] -ne 1 })
 
@@ -116,10 +239,8 @@ if ($mp) {
 $exclTotal   = $exclPath.Count + $exclProcess.Count + $exclExt.Count
 
 $nbIfaces = @(Get-ChildItem $netbtKey -ErrorAction SilentlyContinue)
-# NetBT keeps an interface key long after the adapter is gone, so a raw count reports NetBIOS
-# as "on" for hardware that no longer exists. Split live from stale the way the health check
-# does - only the live ones are exposure, the stale ones are just registry litter. If the
-# adapter list cannot be read at all, treat every interface as live rather than as gone.
+# NetBT keeps interface keys for removed adapters, so split live from stale; only live ones
+# are exposure. If the adapter list cannot be read, treat every interface as live.
 $liveAdapters = @{}
 Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
     ForEach-Object { if ($_.InterfaceGuid) { $liveAdapters["$($_.InterfaceGuid)".ToLower()] = $_.Name } }
@@ -154,7 +275,7 @@ Write-Host ("  AutoPlay / AutoRun             : {0}" -f $(if ($autoRunOff) { 'di
 Write-Host ("  NTLM level                     : {0}" -f $(if ($lmLevel -ge 5) { "$lmLevel (NTLMv2 only, good)" } elseif ($null -eq $lmLevel) { 'not set (client sends NTLMv2 only, but LM/NTLMv1 from others is still accepted)' } else { "$lmLevel (below 5, LM/NTLMv1 still allowed)" })) -ForegroundColor Gray
 Write-Host ("  Admin shares (C`$, ADMIN`$)      : {0}" -f $(if ($sharesOff) { 'off (good)' } elseif ($adminShares) { "on - $(($adminShares.Name) -join ', ')" } else { 'on' })) -ForegroundColor Gray
 
-# --- changes, each its own y/n ----------------------------------------------------------
+# Changes, each behind its own y/n
 Write-Host "  --- changes (each is optional) ---" -ForegroundColor White
 $applied = 0
 $offered = $false
@@ -163,16 +284,15 @@ if ($mp -and $asrPending.Count -gt 0) {
     $offered = $true
     Write-Host "  Moves these Defender rules from off/audit/warn to Block:" -ForegroundColor DarkGray
     $asrPending | ForEach-Object { Write-Host "    - $($asrTargets[$_])" -ForegroundColor DarkGray }
-    # Measured on a real machine: this rule blocks MSYS2's bash.exe outright (Defender event
-    # 1121), because Windows ships its own bash.exe in System32 for WSL and MSYS2's copy is
-    # unsigned. It killed the MSYS2 installer mid-run. Git for Windows' bash.exe is signed and
-    # is not affected. Said up front rather than left as a mystery months later.
+    # This rule blocks MSYS2's unsigned bash.exe (Defender event 1121) because System32 has its
+    # own bash.exe; Git for Windows' signed bash.exe is not affected.
     if ($asrPending -contains 'c0033c00-d16d-4114-a5a0-dc9b3a7d2ceb') {
         Write-Host "  Note: 'copied or impersonated system tools' blocks MSYS2's C:\msys64\usr\bin\bash.exe" -ForegroundColor DarkGray
         Write-Host "  (Windows has its own bash.exe in System32). Exempt it afterwards if you use MSYS2:" -ForegroundColor DarkGray
         Write-Host "    Add-MpPreference -AttackSurfaceReductionOnlyExclusions 'C:\msys64\*'" -ForegroundColor DarkGray
     }
     if (Confirm-Change "Set these $($asrPending.Count) ASR rule(s) to Block?") {
+        Start-ChangeRecord
         foreach ($id in $asrPending) {
             try { Set-AsrRule -Id $id -Label $asrTargets[$id] }
             catch { Write-Host "    could not set '$($asrTargets[$id])': $($_.Exception.Message)" -ForegroundColor Yellow }
@@ -182,10 +302,10 @@ if ($mp -and $asrPending.Count -gt 0) {
         $after  = Get-AsrState
         $stuck  = @($asrPending | Where-Object { $after[$_] -ne 1 })
         $wonSet = $asrPending.Count - $stuck.Count
-        # One item, not one per rule: $applied counts the changes the user agreed to, and
-        # adding five here made the closing line read "10 items" for six answered prompts.
+        # One item, not one per rule: $applied counts answered prompts.
         if ($wonSet -gt 0) { Write-Host "    $wonSet rule(s) now Block" -ForegroundColor DarkGray; $applied++ }
         foreach ($id in $stuck) { Write-Host "    still not Block (managed elsewhere?): $($asrTargets[$id])" -ForegroundColor Yellow }
+        Save-ChangeRecord
     }
 }
 
@@ -195,8 +315,9 @@ if ($mp -and $exclTotal -gt 0) {
     $exclPath    | ForEach-Object { Write-Host "    - path:      $_" -ForegroundColor DarkGray }
     $exclProcess | ForEach-Object { Write-Host "    - process:   $_" -ForegroundColor DarkGray }
     $exclExt     | ForEach-Object { Write-Host "    - extension: $_" -ForegroundColor DarkGray }
-    Write-Host "  Keep only the ones you can justify; re-add any with Add-MpPreference -ExclusionPath '<path>'." -ForegroundColor DarkGray
+    Write-Host "  Keep only the ones you can justify; the change record keeps the full list, and Add-MpPreference -ExclusionPath '<path>' re-adds one." -ForegroundColor DarkGray
     if (Confirm-Change "Remove all $exclTotal Defender exclusion(s)?") {
+        Start-ChangeRecord
         try {
             if ($exclPath)    { Remove-MpPreference -ExclusionPath $exclPath -ErrorAction Stop }
             if ($exclProcess) { Remove-MpPreference -ExclusionProcess $exclProcess -ErrorAction Stop }
@@ -216,6 +337,7 @@ if ($mp -and $exclTotal -gt 0) {
         } catch {
             Write-Host "    could not clear exclusions (set by policy?): $($_.Exception.Message)" -ForegroundColor Yellow
         }
+        Save-ChangeRecord
     }
 }
 
@@ -224,10 +346,9 @@ if ($mp -and $null -ne $quarantineDays -and $quarantineDays -lt $quarantineDefau
     Write-Host "  Defender deletes quarantined files after $quarantineDays day(s) instead of the $quarantineDefaultDays-day default." -ForegroundColor DarkGray
     Write-Host "  The file and the threat history go with it, so something noticed a week later cannot be looked at." -ForegroundColor DarkGray
     if (Confirm-Change "Keep quarantined items for $quarantineDefaultDays days?") {
+        Start-ChangeRecord
         try {
-            # A value under the Policies key outranks Set-MpPreference exactly the way it does
-            # for ASR rules, so write it there too when it exists - otherwise the preference is
-            # set, the call succeeds, and Defender keeps purging on the policy's schedule.
+            # A value under the Policies key outranks Set-MpPreference, so update it there too when present.
             if ($null -ne (Get-ItemProperty $quarantinePolicyKey -Name PurgeItemsAfterDelay -ErrorAction SilentlyContinue)) {
                 Set-ItemProperty $quarantinePolicyKey -Name PurgeItemsAfterDelay -Value $quarantineDefaultDays -Type DWord -ErrorAction Stop
             }
@@ -243,6 +364,7 @@ if ($mp -and $null -ne $quarantineDays -and $quarantineDays -lt $quarantineDefau
         } catch {
             Write-Host "    could not change quarantine retention: $($_.Exception.Message)" -ForegroundColor Yellow
         }
+        Save-ChangeRecord
     }
 }
 
@@ -261,6 +383,7 @@ if ($nbOn.Count -gt 0) {
     # Stale keys are written too: it costs nothing, and it stops NetBIOS coming back on if the
     # adapter is ever reinstalled into the same interface key.
     if (Confirm-Change "Disable NetBIOS on $($nbLive.Count) live interface(s)$nbStaleNote?") {
+        Start-ChangeRecord
         foreach ($iface in $nbIfaces) {
             try { Set-ItemProperty $iface.PSPath -Name NetbiosOptions -Value 2 -Type DWord -ErrorAction Stop }
             catch { Write-Host "    $($iface.PSChildName): $($_.Exception.Message)" -ForegroundColor Yellow }
@@ -269,6 +392,7 @@ if ($nbOn.Count -gt 0) {
                   Where-Object { (Get-ItemProperty $_.PSPath -Name NetbiosOptions -ErrorAction SilentlyContinue).NetbiosOptions -ne 2 })
         if ($left.Count -eq 0) { Write-Host "    NetBIOS disabled on every interface (live and stale)" -ForegroundColor DarkGray; $applied++ }
         else { Write-Host "    $($left.Count) interface(s) unchanged" -ForegroundColor Yellow }
+        Save-ChangeRecord
     }
 }
 
@@ -276,6 +400,7 @@ if (-not $autoRunOff) {
     $offered = $true
     Write-Host "  Blocks USB sticks and disks from auto-starting anything when plugged in." -ForegroundColor DarkGray
     if (Confirm-Change "Disable AutoPlay/AutoRun on all drive types?") {
+        Start-ChangeRecord
         try {
             # New-Item -Force on an EXISTING registry key recreates it and deletes
             # every value in it, so only create the key when it is actually missing.
@@ -287,6 +412,7 @@ if (-not $autoRunOff) {
         } catch {
             Write-Host "    could not disable AutoPlay: $($_.Exception.Message)" -ForegroundColor Yellow
         }
+        Save-ChangeRecord
     }
 }
 
@@ -295,6 +421,7 @@ if ($null -eq $lmLevel -or $lmLevel -lt 5) {
     Write-Host "  Level 5 sends and accepts NTLMv2 only, refusing the crackable LM and NTLMv1 responses." -ForegroundColor DarkGray
     Write-Host "  Skip it if a very old NAS or network printer here can only authenticate with NTLMv1." -ForegroundColor DarkGray
     if (Confirm-Change "Restrict NTLM to v2 only? (LmCompatibilityLevel = 5)") {
+        Start-ChangeRecord
         try {
             Set-ItemProperty $lsaKey -Name LmCompatibilityLevel -Value 5 -Type DWord -ErrorAction Stop
             Write-Host "    LmCompatibilityLevel = 5" -ForegroundColor DarkGray
@@ -302,6 +429,7 @@ if ($null -eq $lmLevel -or $lmLevel -lt 5) {
         } catch {
             Write-Host "    could not set LmCompatibilityLevel: $($_.Exception.Message)" -ForegroundColor Yellow
         }
+        Save-ChangeRecord
     }
 }
 
@@ -311,6 +439,7 @@ if (-not $sharesOff) {
     Write-Host "  holding local admin credentials. Skip if backup or remote-admin tools here use \\host\C`$." -ForegroundColor DarkGray
     Write-Host "  Restarting the Server service briefly drops any active SMB session. IPC`$ stays - Windows needs it." -ForegroundColor DarkGray
     if (Confirm-Change "Turn off the hidden admin shares?") {
+        Start-ChangeRecord
         try {
             Set-ItemProperty $lanmanKey -Name AutoShareWks -Value 0 -Type DWord -ErrorAction Stop
             Set-ItemProperty $lanmanKey -Name AutoShareServer -Value 0 -Type DWord -ErrorAction Stop
@@ -322,6 +451,7 @@ if (-not $sharesOff) {
         } catch {
             Write-Host "    could not turn off admin shares: $($_.Exception.Message)" -ForegroundColor Yellow
         }
+        Save-ChangeRecord
     }
 }
 
@@ -330,3 +460,8 @@ if (-not $offered) { Write-Host "  nothing to change - every item is already app
 Write-Host ""
 if ($applied -eq 0) { Write-Host "Hardening pass finished - nothing changed." -ForegroundColor DarkGray }
 else { Write-Host "Hardening pass finished - $applied item(s) applied. Reboot so all of them take effect." -ForegroundColor Green }
+if ($script:ChangeRecord) {
+    Write-Host "Change record: $($script:ChangeRecord.Before) and $($script:ChangeRecord.After)" -ForegroundColor DarkGray
+    try { Stop-Transcript | Out-Null } catch { Write-Verbose -Message 'The transcript was not running.' }
+}
+$ErrorActionPreference = $previousErrorAction

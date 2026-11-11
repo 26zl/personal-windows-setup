@@ -20,11 +20,12 @@
 
   OPTIONAL, OFF BY DEFAULT: -DeepBlueCliPath and -PrivescCheckPath delegate to two
   third-party audit tools, if you already have them. Nothing is downloaded and neither
-  tool ships with this script. Passing a path is the point where "this changes nothing"
-  stops being a promise about code you can read here and becomes a promise about
-  someone else's - both are read-only by design, but you are the one choosing to trust
-  them. PrivescCheck also writes a CSV report; it goes to a uniquely named temporary
-  file and is deleted again when the run ends. That is the only disk write in this file.
+  tool ships with this script. Both are read-only by design, but passing a path means
+  trusting code outside this file.
+
+  Files are written in two cases only, both on request: -ReportPath writes the report
+  there, and delegation captures each tool's output (and PrivescCheck's CSV report) in
+  uniquely named temporary files that are deleted when the run ends.
 #>
 
 [CmdletBinding()]
@@ -65,17 +66,37 @@ param(
     [string]$PrivescCheckPath
 )
 
+# With irm | iex or a script block, script scope is the caller's session: note what was there,
+# so the variables this run adds can be removed and the settings it changes put back at the end.
+$callerVariables = if ($PSCommandPath) { $null } else { @(Get-Variable -Scope Script -ErrorAction Ignore | ForEach-Object { $_.Name }) }
+$previousErrorAction = $ErrorActionPreference
+$previousProgress = $ProgressPreference
+$previousOutputEncoding = $null
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
-# Evidence comes from Windows, and on a non-English installation that text carries
-# characters the console's default code page cannot render. A Norwegian update title
-# came back as "Defender Antivirus a EUR" instead of an en dash, which makes the finding
-# look corrupted and, worse, unsearchable. This is process-scoped - it changes the
-# encoding of this PowerShell host's output stream and nothing on the machine - and it is
-# wrapped because a redirected or non-interactive host has no console to configure.
+if ($env:NO_COLOR) {
+    # https://no-color.org: the same output without colours.
+    function Write-Host {
+        [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidOverwritingBuiltInCmdlets', '', Justification = 'Forwards to the real Write-Host without colours when NO_COLOR is set.')]
+        param(
+            [Parameter(Position = 0, ValueFromPipeline, ValueFromRemainingArguments)][object]$Object,
+            [switch]$NoNewline, [object]$Separator,
+            [System.ConsoleColor]$ForegroundColor, [System.ConsoleColor]$BackgroundColor
+        )
+        process {
+            $null = $PSBoundParameters.Remove('ForegroundColor')
+            $null = $PSBoundParameters.Remove('BackgroundColor')
+            Microsoft.PowerShell.Utility\Write-Host @PSBoundParameters
+        }
+    }
+}
+
+# Localised evidence text can contain characters the default console code page cannot
+# render. Process-scoped; a redirected host has no console to configure, hence the try.
 try {
     if ([Console]::OutputEncoding.CodePage -ne 65001) {
+        $previousOutputEncoding = [Console]::OutputEncoding
         [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
     }
 } catch {
@@ -168,20 +189,10 @@ function Get-ServiceState {
 
 function Invoke-ExternalAudit {
     <#
-      Runs a third-party read-only audit script the user pointed at, in a child
-      PowerShell process, and hands back its output as lines.
-
-      A child process rather than dot-sourcing, for three reasons: the other script's
-      $ErrorActionPreference, its functions and any name collisions cannot reach into
-      this run; a terminating error over there cannot take this run down; and its
-      output cannot end up in one of our return values by accident. The cost is a few
-      seconds of startup, which is acceptable for something that is opt-in anyway.
-
-      This is the one place where the "changes nothing" promise stops being ours.
-      Everything else here is a read the reader can verify in this file; this runs a
-      program written by someone else. Both supported tools are read-only by design,
-      but the caller is the one who decided to trust them, which is why nothing runs
-      unless a path is passed explicitly and nothing is ever downloaded.
+      Runs a third-party read-only audit script the user pointed at and returns its
+      output as lines. A child process keeps the other script's preferences, functions
+      and terminating errors out of this run. Output is captured in uniquely named
+      temporary files that are deleted before returning.
     #>
     param(
         [Parameter(Mandatory)][string]$ScriptPath,
@@ -227,6 +238,32 @@ function Invoke-ExternalAudit {
             if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
         }
     }
+}
+
+function Get-WingetUpgradeList {
+    <#
+      Runs "winget upgrade" as a listing with a time limit, because a slow or blocked package
+      source can otherwise stall the whole run. winget is the only process this starts.
+    #>
+    param([Parameter(Mandatory)][string]$WingetPath, [int]$TimeoutSeconds = 120)
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $WingetPath
+    $startInfo.Arguments = 'upgrade --disable-interactivity'
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    $startInfo.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    $stdOut = $process.StandardOutput.ReadToEndAsync()
+    $stdErr = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        try { $process.Kill() } catch { Write-Verbose -Message 'winget had already exited.' }
+        return [PSCustomObject]@{ TimedOut = $true; TimeoutSeconds = $TimeoutSeconds; ExitCode = $null; Output = '' }
+    }
+    $process.WaitForExit()
+    [PSCustomObject]@{ TimedOut = $false; TimeoutSeconds = $TimeoutSeconds; ExitCode = $process.ExitCode; Output = $stdOut.Result + $stdErr.Result }
 }
 
 function Format-Size {
@@ -449,9 +486,11 @@ function Export-Report {
     }
 
     try {
-        [IO.File]::WriteAllText($Path, $sb.ToString(), (New-Object Text.UTF8Encoding($false)))
+        # .NET resolves relative paths against the process directory, not the PowerShell location.
+        $fullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+        [IO.File]::WriteAllText($fullPath, $sb.ToString(), (New-Object Text.UTF8Encoding($false)))
         Write-Host ''
-        Write-Host "  Report written: $Path" -ForegroundColor Green
+        Write-Host "  Report written: $fullPath" -ForegroundColor Green
     } catch {
         Write-Host ''
         Write-Host "  Could not write the report: $($_.Exception.Message)" -ForegroundColor Yellow
@@ -503,7 +542,8 @@ function Test-SystemHealth {
     # Enterprise, Education and IoT Enterprise get a longer lifecycle than Home and Pro on
     # the same build, so a single date per build would report a supported Enterprise machine
     # as expired. This table is the only lifecycle data in the script - the update check
-    # deliberately does not carry a second copy.
+    # deliberately does not carry a second copy. Dates: the Windows release-information pages
+    # on learn.microsoft.com (26H2 = OS build 26300 per windows11-release-information, 2026-11-10).
     $eosTable = @{
         19041 = @{ Name = 'Windows 10 2004';  Client = '2021-12-14'; Long = '2021-12-14' }
         19042 = @{ Name = 'Windows 10 20H2';  Client = '2022-05-10'; Long = '2023-05-09' }
@@ -515,6 +555,7 @@ function Test-SystemHealth {
         22631 = @{ Name = 'Windows 11 23H2';  Client = '2025-11-11'; Long = '2026-11-10' }
         26100 = @{ Name = 'Windows 11 24H2';  Client = '2026-10-13'; Long = '2027-10-12' }
         26200 = @{ Name = 'Windows 11 25H2';  Client = '2027-10-12'; Long = '2028-10-10' }
+        26300 = @{ Name = 'Windows 11 26H2';  Client = '2028-10-10'; Long = '2029-10-09' }
         # 26H1 ships only on new hardware - it is not offered as an in-place update from
         # 24H2 or 25H2 - so it turns up on new machines rather than through Windows Update.
         28000 = @{ Name = 'Windows 11 26H1';  Client = '2028-03-14'; Long = '2029-03-13' }
@@ -5300,13 +5341,11 @@ function Test-NetworkHealth {
         Add-Skip -Message 'Name Resolution Policy rules could not be read.'
     }
 
-    # File shares. Inferring "not sharing" from port 445 was wrong in both directions:
-    # the port is open on almost every Windows machine, and a share can exist behind it.
+    # File shares are enumerated directly: port 445 is open on almost every Windows machine,
+    # so it says nothing about whether anything is shared.
     try {
-        # The built-in administrative shares, which every Windows machine publishes and which
-        # are not a finding: the per-drive C$/D$ ones, plus the fixed-name ADMIN$, IPC$ and
-        # print$. The old filter only matched a single letter before the $, so ADMIN$ was
-        # reported as a published share on every machine that had it.
+        # Built-in administrative shares are not a finding: the per-drive C$/D$ ones plus the
+        # fixed-name ADMIN$, IPC$, PRINT$ and FAX$.
         $builtinShares = @('ADMIN$', 'IPC$', 'PRINT$', 'FAX$')
         $shares = @(Get-SmbShare -ErrorAction Stop | Where-Object {
                 $_.Name -notmatch '^\w\$$' -and $builtinShares -notcontains $_.Name.ToUpperInvariant()
@@ -7074,15 +7113,16 @@ function Test-SecurityHealth {
     # invoked, if the caller has it, and the result is attributed.
     if ($PrivescCheckPath) {
         Write-Host '    running PrivescCheck (this takes a while)...' -ForegroundColor DarkGray
-        # -Audit adds the configuration checks, -Silent suppresses its own banner, and CSV
-        # is the one stable, parseable output it offers. -Report makes it write a file,
-        # which is the only disk write anywhere in this script - so it goes to a uniquely
-        # named temporary path and is deleted again in the finally block below. The header
-        # and the README both say so rather than leaving the reader to discover it.
+        # -Audit adds the configuration checks, -Silent drops its banner, and CSV is its one
+        # stable, parseable output. The report goes to a uniquely named temporary path that
+        # the finally block below deletes.
         $privescPrefix = Join-Path ([IO.Path]::GetTempPath()) ("privesc-{0}" -f [guid]::NewGuid().ToString('N'))
         $privescCsv = "$privescPrefix.csv"
         try {
-            $privescExpression = ". '$($PrivescCheckPath -replace "'", "''")'; Invoke-PrivescCheck -Audit -Silent -Format CSV -Report '$($privescPrefix -replace "'", "''")'"
+            # EscapeSingleQuotedStringContent also doubles the typographic quotes PowerShell treats as '.
+            $privescExpression = ". '{0}'; Invoke-PrivescCheck -Audit -Silent -Format CSV -Report '{1}'" -f `
+                [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($PrivescCheckPath),
+                [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($privescPrefix)
             $privescRun = Invoke-ExternalAudit -ScriptPath $PrivescCheckPath -Expression $privescExpression -TimeoutSeconds 600
             if (-not $privescRun.Ok) {
                 Add-Skip -Message ("PrivescCheck was not run: {0}" -f $privescRun.Reason)
@@ -7113,12 +7153,8 @@ function Test-SecurityHealth {
         } catch {
             Add-Skip -Message ("PrivescCheck output could not be parsed: {0}" -f $_.Exception.Message)
         } finally {
-            # Leave nothing behind: the report file existing is the only way this script
-            # ever touches the disk, and it must not outlive the run that caused it.
-            # -LiteralPath on the directory with -Filter on the leaf, not -Path with a
-            # wildcard: TEMP sits under the user profile, and a username containing [ or ]
-            # would make -Path treat it as a character class, silently match nothing, and
-            # leave the report behind. Same trap as the registry read earlier in this file.
+            # The report must not outlive the run. -LiteralPath with -Filter, not a wildcard
+            # -Path: a [ or ] in the username would turn the TEMP path into a character class.
             $privescDir = Split-Path -Path $privescPrefix -Parent
             $privescLeaf = Split-Path -Path $privescPrefix -Leaf
             foreach ($leftover in @(Get-ChildItem -LiteralPath $privescDir -Filter "$privescLeaf.*" -File -ErrorAction SilentlyContinue)) {
@@ -8117,8 +8153,13 @@ function Test-UpdateHealth {
             # to the user's winget settings, and this tool promises to change nothing. On a
             # machine where the agreements have not been accepted yet, winget exits non-zero
             # and the check reports a skip instead.
-            $wingetRaw = & winget upgrade --disable-interactivity 2>&1 | Out-String
-            $wingetExit = $LASTEXITCODE
+            $wingetRun = Get-WingetUpgradeList -WingetPath @($wingetCmd)[0].Source
+            if ($wingetRun.TimedOut) {
+                Add-Skip -Message "winget upgrade gave no answer within $($wingetRun.TimeoutSeconds) seconds and was stopped - package list not assessed."
+                return
+            }
+            $wingetRaw = $wingetRun.Output
+            $wingetExit = $wingetRun.ExitCode
             if ($wingetExit -ne 0) {
                 $firstLine = @($wingetRaw -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 1
                 Add-Skip -Message "winget upgrade exited with code $wingetExit - package list not assessed. $firstLine"
@@ -8854,19 +8895,11 @@ function Test-LoggingHealth {
         if ($Fast) {
             Add-Skip -Message 'DeepBlueCLI was not run because -Fast is set - it reads whole event logs and takes minutes.'
         } else {
-            # The two tools are not independent: DeepBlueCLI reads 4688 command lines and
-            # 4104 script blocks, and this script is what verifies those are being written.
-            # On a machine where Process Creation auditing is off, DeepBlueCLI returns a
-            # clean result because there is nothing to read - which is the most misleading
-            # possible outcome. Say so next to its verdict rather than letting the absence
-            # of findings read as an absence of problems.
+            # DeepBlueCLI reads 4688 command lines and 4104 script blocks. With that logging
+            # off it returns a clean result over empty logs, so say so next to its verdict.
             $deepBlueBlind = @()
-            # Reuse what the audit-policy check above already worked out. Re-running
-            # auditpol here and matching its output for the word "success" would have been
-            # wrong twice over: it is translated on a localised Windows, and $auditRaw is
-            # already the audit block's variable, so writing to it again would have quietly
-            # clobbered state inside the same function. $auditStates is keyed by GUID,
-            # which auditpol does not translate.
+            # Reuse the audit-policy result above: $auditStates is keyed by GUID, which
+            # auditpol does not translate.
             if ($auditReadable -and [string]$auditStates[$processCreationGuid] -eq 'Off') {
                 $deepBlueBlind += 'Process Creation auditing is off, so there are no 4688 command lines to analyse'
             }
@@ -8883,7 +8916,8 @@ function Test-LoggingHealth {
                 Write-Host ("    running DeepBlueCLI against the {0} log..." -f $logName) -ForegroundColor DarkGray
                 # Its own output is objects; Format-List gives stable text without needing
                 # to guess property names that differ between its releases.
-                $deepBlueExpression = "& '$($DeepBlueCliPath -replace "'", "''")' -log $logName | Format-List | Out-String -Width 400"
+                $deepBlueExpression = "& '{0}' -log {1} | Format-List | Out-String -Width 400" -f `
+                    [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($DeepBlueCliPath), $logName
                 $deepBlueRun = Invoke-ExternalAudit -ScriptPath $DeepBlueCliPath -Expression $deepBlueExpression -TimeoutSeconds 600
                 if (-not $deepBlueRun.Ok) {
                     $deepBlueFailures += "$logName ($($deepBlueRun.Reason))"
@@ -9606,13 +9640,8 @@ function Test-SoftwareHealth {
         Add-Ok -Message 'No browser policy forces extensions, a homepage or a search provider (Chrome, Edge and Firefox checked in both HKLM and HKCU).'
     }
 
-    # Is the browser actually being updated? Measured from the binary date, not from
-    # whether a particular updater exists. Checking for the gupdate service and the
-    # GoogleUpdate scheduled tasks was the obvious approach and it is wrong: a
-    # winget-managed or Store-managed browser has neither and is still perfectly current,
-    # so that check reports a false alarm on an increasingly common setup. A version floor
-    # is no better - it needs re-editing every few weeks. What holds regardless of how the
-    # browser is kept up to date is that the executable changes when it updates, and
+    # Judged by the executable's age, not by a particular updater: winget- and Store-managed
+    # browsers have no gupdate service or GoogleUpdate tasks and are still current, and
     # browsers ship every two to four weeks.
     $browserBinaries = @(
         @{ Name = 'Chrome'; Path = (Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe') }
@@ -9647,6 +9676,8 @@ function Test-SoftwareHealth {
 
 
 # run
+
+try {
 
 $allCategories = 'System', 'Stability', 'Drivers', 'Storage', 'Performance', 'Power',
 'Network', 'Security', 'Privacy', 'Updates', 'Logging', 'Software'
@@ -9705,3 +9736,17 @@ Write-Host "  Finished in $([math]::Round(((Get-Date) - $started).TotalSeconds))
 if ($ReportPath) { Export-Report -Path $ReportPath }
 
 Write-Host ''
+
+} finally {
+    # Also runs on Ctrl+C: put the caller's session back the way it was.
+    if ($previousOutputEncoding) {
+        try { [Console]::OutputEncoding = $previousOutputEncoding } catch { Write-Verbose -Message 'Console output encoding could not be restored.' }
+    }
+    $ErrorActionPreference = $previousErrorAction
+    $ProgressPreference = $previousProgress
+    if ($null -ne $callerVariables) {
+        # A pipeline rather than foreach, whose loop variable would itself be left behind.
+        @(Get-Variable -Scope Script -ErrorAction Ignore | Where-Object { $callerVariables -notcontains $_.Name }) |
+            ForEach-Object { Remove-Variable -Name $_.Name -Scope Script -ErrorAction SilentlyContinue }
+    }
+}
