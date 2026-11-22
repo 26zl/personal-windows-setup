@@ -21,7 +21,7 @@ BeforeAll {
 
     # The pure helpers, defined here without running the script.
     foreach ($name in 'Select-DriveLetter', 'ConvertFrom-DevDriveQuery', 'Merge-FilterList', 'Get-UpdatedPathValue',
-        'Get-MavenOptsValue', 'Get-CacheMap', 'Test-SamePath', 'Test-PathOnDrive') {
+        'Get-MavenOptsValue', 'Get-CacheMap', 'Test-SamePath', 'Test-PathOnDrive', 'Get-BackupPath') {
         $definition = $script:Functions | Where-Object { $_.Name -eq $name }
         . ([scriptblock]::Create($definition.Extent.Text))
     }
@@ -62,6 +62,32 @@ Describe 'Change contract' {
             if ($text -notmatch 'SupportsShouldProcess' -or $text -notmatch '\$PSCmdlet\.ShouldProcess\(') { "$name in $($function.Name)" }
         }
         @($offenders) | Should -BeNullOrEmpty
+    }
+
+    It 'changes files through .NET only in functions that ask ShouldProcess' {
+        $types = '^(System\.)?IO\.(File|Directory|FileSystemAclExtensions)$'
+        $calls = @($script:DevDriveAst.FindAll(
+                { param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true))
+        $offenders = foreach ($call in $calls) {
+            $member = $call.Member.Extent.Text
+            $static = $call.Static -and $call.Expression -is [System.Management.Automation.Language.TypeExpressionAst] -and
+            $call.Expression.TypeName.FullName -match $types -and $member -match '^(Move|Delete|Copy|Replace|Create|Write|Append|Set)'
+            $instance = -not $call.Static -and $member -match '^(SetAccessControl|MoveTo|Delete)$'
+            if (-not ($static -or $instance)) { continue }
+            $function = $call.Parent
+            while ($function -and $function -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $function = $function.Parent }
+            if (-not $function) { "$($call.Extent.Text) (outside any function)"; continue }
+            $text = $function.Body.Extent.Text
+            if ($text -notmatch 'SupportsShouldProcess' -or $text -notmatch '\$PSCmdlet\.ShouldProcess\(') { "$($call.Extent.Text) in $($function.Name)" }
+        }
+        @($offenders) | Should -BeNullOrEmpty
+    }
+
+    It 'moves the original projects folder by a rename only, never a copy that can stop halfway' {
+        $move = $script:Functions | Where-Object { $_.Name -eq 'Move-ProjectFolder' }
+        $move.Body.Extent.Text | Should -Match '\[IO\.Directory\]::Move\('
+        @($move.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
+                    $n.GetCommandName() -match '^(Move-Item|Rename-Item|mv|move)$' }, $true)) | Should -BeNullOrEmpty
     }
 
     It 'never changes Defender settings' {
@@ -154,9 +180,12 @@ Describe 'PATH update' {
     }
 
     It 'matches an entry written with an environment variable and keeps the others unexpanded' {
-        $old = Join-Path $env:SystemRoot 'cargo-test-bin'
-        Get-UpdatedPathValue -PathValue '%SystemRoot%\cargo-test-bin;%USERPROFILE%\bin' -Old $old -New 'S:\cargo\bin' |
-            Should -Be 'S:\cargo\bin;%USERPROFILE%\bin'
+        # A variable of the test's own, so this runs the same on Linux CI.
+        $env:DEVDRIVE_TEST_HOME = 'C:\Users\x'
+        try {
+            Get-UpdatedPathValue -PathValue '%DEVDRIVE_TEST_HOME%\.cargo\bin;%USERPROFILE%\bin' -Old 'C:\Users\x\.cargo\bin' -New 'S:\cargo\bin' |
+                Should -Be 'S:\cargo\bin;%USERPROFILE%\bin'
+        } finally { Remove-Item Env:\DEVDRIVE_TEST_HOME -ErrorAction SilentlyContinue }
     }
 
     It 'appends the new entry when the old one is missing, and only once' {
@@ -214,5 +243,27 @@ Describe 'Path helpers' {
         Test-PathOnDrive -Path 's:\packages\npm' -Letter 'S' | Should -BeTrue
         Test-PathOnDrive -Path 'C:\Users' -Letter 'S' | Should -BeFalse
         Test-PathOnDrive -Path '' -Letter 'S' | Should -BeFalse
+    }
+}
+
+Describe 'Backup of the original projects folder' {
+    BeforeAll {
+        $script:Stamp = [datetime]::new(2026, 11, 23, 0, 33, 0)
+    }
+
+    It 'goes into the profile when the folder is on the same drive' {
+        Get-BackupPath -Source 'C:\Users\u\Desktop\Prosjekter' -UserProfile 'C:\Users\u' -Stamp $script:Stamp |
+            Should -Be 'C:\Users\u\Prosjekter-backup-20261123-0033'
+        Get-BackupPath -Source 'c:\work\Projects\' -UserProfile 'C:\Users\u\' -Stamp $script:Stamp |
+            Should -Be 'C:\Users\u\Projects-backup-20261123-0033'
+    }
+
+    It 'stays beside the folder on another drive, so moving it is a rename' {
+        Get-BackupPath -Source 'D:\a\_temp\Projects' -UserProfile 'C:\Users\runneradmin' -Stamp $script:Stamp |
+            Should -Be 'D:\a\_temp\Projects-backup-20261123-0033'
+        Get-BackupPath -Source 'E:\Projects' -UserProfile 'C:\Users\u' -Stamp $script:Stamp |
+            Should -Be 'E:\Projects-backup-20261123-0033'
+        Get-BackupPath -Source '\\nas\share\Projects' -UserProfile 'C:\Users\u' -Stamp $script:Stamp |
+            Should -Be '\\nas\share\Projects-backup-20261123-0033'
     }
 }

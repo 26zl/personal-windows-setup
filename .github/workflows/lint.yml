@@ -232,7 +232,12 @@ jobs:
           if ((git -c safe.directory=* -C $moved rev-parse HEAD) -ne $head) { Write-Host '::error::HEAD differs after the move'; exit 1 }
           if ((Get-Content (Join-Path $moved 'a.txt')) -ne 'two') { Write-Host '::error::the uncommitted change was lost'; exit 1 }
           if (Test-Path (Join-Path $moved 'node_modules')) { Write-Host '::error::node_modules was copied'; exit 1 }
-          if (-not (Get-ChildItem $env:USERPROFILE -Directory -Filter 'Projects-backup-*')) { Write-Host '::error::no backup of the original folder'; exit 1 }
+          # The original is renamed on its own drive: into the profile when that is the same drive, else beside it.
+          # Here the folder is on D: and the profile on C:, which is the case a plain Move-Item got wrong.
+          $backupParent = if ((Split-Path -Qualifier $src) -eq (Split-Path -Qualifier $env:USERPROFILE)) { $env:USERPROFILE } else { Split-Path -Parent $src }
+          $backup = @(Get-ChildItem $backupParent -Directory -Filter 'Projects-backup-*')
+          if ($backup.Count -ne 1) { Write-Host "::error::expected one backup of the original folder in $backupParent, found $($backup.Count)"; exit 1 }
+          if (-not (Test-Path (Join-Path $backup[0].FullName 'demo\.git')) -or (Get-Content (Join-Path $backup[0].FullName 'demo\a.txt')) -ne 'two') { Write-Host '::error::the backup is not the whole original'; exit 1 }
 
           $second = powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\devdrive\setup-devdrive.ps1 -VhdPath $vhd -SizeGB 50 -NoDesktopLink -MoveProjectsFrom $src | Out-String
           Write-Host $second

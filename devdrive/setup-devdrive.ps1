@@ -21,8 +21,9 @@
        caches over. CARGO_HOME also holds rustup's proxies, so the user PATH follows it.
     5. Creates <drive>:\<ProjectsFolder> (private to you, like your profile) and a link to it on
        the Desktop. -MoveProjectsFrom copies an existing folder there without node_modules,
-       checks the copy file by file and per git repository, moves the original to
-       %USERPROFILE%\<name>-backup-<date> and leaves a link at the old path.
+       checks the copy file by file and per git repository, renames the original to
+       <name>-backup-<date> (in %USERPROFILE%, or beside the folder when that is on another
+       drive) and leaves a link at the old path.
 
   It does not change Defender. Performance mode (asynchronous scanning on trusted Dev Drives)
   is reported, not switched: hardening baselines often turn it off on purpose.
@@ -159,7 +160,7 @@ function Get-MavenOptsValue {
 function Get-CacheMap {
     # Where each tool's cache goes under $Root, and where it lives by default.
     param([string]$Root, [string]$UserProfile, [string]$LocalAppData, [string]$AppData, [string]$GoPath)
-    if (-not $GoPath) { $GoPath = Join-Path $UserProfile 'go' }
+    if (-not $GoPath) { $GoPath = "$UserProfile\go" }
     @(
         [pscustomobject]@{ Tool = 'npm';              Kind = 'Env';    Name = 'npm_config_cache';           Path = "$Root\npm";              Old = @("$LocalAppData\npm-cache", "$AppData\npm-cache") }
         [pscustomobject]@{ Tool = 'pnpm store';       Kind = 'PnpmRc'; Name = 'store-dir';                  Path = "$Root\pnpm-store";       Old = @("$LocalAppData\pnpm\store") }
@@ -186,6 +187,19 @@ function Test-SamePath {
 function Test-PathOnDrive {
     param([string]$Path, [string]$Letter)
     [bool]($Path -and $Letter -and $Path.Length -ge 2 -and $Path.Substring(0, 2) -ieq "${Letter}:")
+}
+
+function Get-BackupPath {
+    # Where the original projects folder goes. It stays on its own drive, so moving it there is a
+    # rename: into the profile when that is on the same drive, else beside the folder.
+    param([string]$Source, [string]$UserProfile, [datetime]$Stamp)
+    $Source = $Source.TrimEnd('\')
+    $cut = $Source.LastIndexOf('\')
+    if ($cut -lt 0) { throw "$Source is not a folder path" }
+    $drive = { param($p) if ($p -match '^([A-Za-z]:|\\\\[^\\]+\\[^\\]+)') { $Matches[1].ToUpperInvariant() } }
+    $sourceDrive = & $drive $Source
+    $parent = if ($sourceDrive -and $sourceDrive -eq (& $drive $UserProfile)) { $UserProfile.TrimEnd('\') } else { $Source.Substring(0, $cut) }
+    '{0}\{1}-backup-{2:yyyyMMdd-HHmm}' -f $parent, $Source.Substring($cut + 1), $Stamp
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -627,8 +641,8 @@ function Set-TreeOwner {
 }
 
 function Move-ProjectFolder {
-    # Copies $Source to $Destination without node_modules, checks the copy, moves $Source to a
-    # backup next to the profile and leaves a directory junction at the old path.
+    # Copies $Source to $Destination without node_modules, checks the copy, renames $Source to a
+    # backup on its own drive and leaves a directory junction at the old path.
     [CmdletBinding(SupportsShouldProcess)]
     param([string]$Source, [string]$Destination)
     $ErrorActionPreference = 'Continue'
@@ -638,8 +652,9 @@ function Move-ProjectFolder {
         if (Test-SamePath ([string]$item.Target) $Destination) { Write-Detail "$Source already points to $Destination"; return }
         throw "$Source is a link to $($item.Target), not a folder"
     }
-    $backup = Join-Path $env:USERPROFILE ('{0}-backup-{1:yyyyMMdd-HHmm}' -f $item.Name, (Get-Date))
-    if (-not $PSCmdlet.ShouldProcess($Source, "copy to $Destination, check it, move the original to $backup and leave a link")) { return }
+    if (-not $item.Parent) { throw "$Source is the root of a drive; move a folder instead" }
+    $backup = Get-BackupPath -Source $item.FullName -UserProfile $env:USERPROFILE -Stamp (Get-Date)
+    if (-not $PSCmdlet.ShouldProcess($Source, "copy to $Destination, check it, rename the original to $backup and leave a link")) { return }
 
     Write-Detail "copying $Source to $Destination (node_modules is left out; reinstall it from the lockfile)"
     $output = & robocopy.exe $Source $Destination /MIR /XD node_modules /COPY:DAT /DCOPY:DAT /SJ /SL /R:1 /W:1 /MT:16 /NP /NFL /NDL 2>&1
@@ -658,8 +673,11 @@ function Move-ProjectFolder {
     Write-Detail ('copy checked: {0} files, {1:N2} GB, {2} git repositories identical' -f $b.Files, ($b.Bytes / 1GB), $gitA.Count)
 
     try {
-        Move-Item -LiteralPath $Source -Destination $backup -ErrorAction Stop
+        # A rename only, so it moves the whole folder or nothing. Move-Item copies and deletes
+        # across drives, stops at the hidden .git folders and leaves the original in two places.
+        [IO.Directory]::Move($item.FullName, $backup)
     } catch {
+        $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
         # Sysinternals handle.exe, when present, names the programs that keep the folder open.
         $holders = ''
         $handle = Get-Command handle64.exe, handle.exe -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -667,7 +685,7 @@ function Move-ProjectFolder {
             $names = @(& $handle.Source -accepteula -nobanner $Source 2>$null | ForEach-Object { if ($_ -match '^(\S+)\s+pid:\s*(\d+)') { '{0} ({1})' -f $Matches[1], $Matches[2] } } | Sort-Object -Unique)
             if ($names) { $holders = ' Open in: ' + ($names -join ', ') + '.' }
         }
-        throw "could not move $Source aside, because a program has a file or folder in it open (VS Code, a terminal, Explorer).$holders Close those and run this again; the copy on the Dev Drive is kept and refreshed. ($($_.Exception.Message))"
+        throw "could not move $Source aside, because a program has a file or folder in it open (VS Code, a terminal, Explorer).$holders Close those and run this again; the copy on the Dev Drive is kept and refreshed. ($reason)"
     }
     $null = New-Item -ItemType Junction -Path $Source -Target $Destination -ErrorAction Stop
     # Anything written in the seconds between the copy and the switch.

@@ -212,7 +212,7 @@ VS Build Tools and VirtualBox are large; remove those lines if you don't need th
 - **Projects:** `<drive>:\Prosjekter` (`-ProjectsFolder`), with a link on the Desktop (skipped when OneDrive syncs the Desktop). `-MoveProjectsFrom` does the following:
   - copies an existing folder without `node_modules`;
   - checks the copy file by file and per git repository (HEAD and `git status`);
-  - moves the original to `%USERPROFILE%\<name>-backup-<date>` and leaves a link at the old path, so shortcuts, scripts and editor history keep working;
+  - renames the original to `<name>-backup-<date>` in `%USERPROFILE%`, or beside the folder when it is on another drive, so the move is a rename that cannot stop halfway, and leaves a link at the old path, so shortcuts, scripts and editor history keep working;
   - stops before switching when a program still has the folder open, and names the program when Sysinternals `handle.exe` is installed.
 
   Reinstall `node_modules` from the lockfile afterwards. Both folders are private to you, like your profile, and extra read access the old folder granted (a sandbox group, for example) is carried over.
