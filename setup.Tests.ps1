@@ -66,8 +66,8 @@ Describe 'Downloads' {
     It 'runs its own scripts only through Resolve-OwnScript' {
         # A raw URL to this repo's scripts outside the help text would bypass the local copy and the pin.
         $code = ($script:SetupAst.EndBlock.Extent.Text, $script:SetupAst.BeginBlock.Extent.Text) -join "`n"
-        $code | Should -Not -Match 'personal-windows-setup/raw/(main|\$RepoRef)/(sysmon|hardening)/'
-        foreach ($own in 'sysmon/install-sysmon.ps1', 'hardening/harden-extras.ps1') {
+        $code | Should -Not -Match 'personal-windows-setup/raw/(main|\$RepoRef)/(sysmon|hardening|devdrive)/'
+        foreach ($own in 'sysmon/install-sysmon.ps1', 'hardening/harden-extras.ps1', 'devdrive/setup-devdrive.ps1') {
             $script:SetupRaw | Should -Match ("Resolve-OwnScript '{0}'" -f [regex]::Escape($own))
         }
     }

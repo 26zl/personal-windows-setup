@@ -80,6 +80,7 @@ jobs:
             @{ File = 'sysmon/sysmonconfig-export.xml'; Script = 'sysmon/install-sysmon.ps1'; Pat = "configSha256\s*=\s*'([A-F0-9]{64})'" }
             @{ File = 'sysmon/install-sysmon.ps1';      Script = 'setup.ps1';                 Pat = "sysmonScriptSha256\s*=\s*'([A-F0-9]{64})'" }
             @{ File = 'hardening/harden-extras.ps1';    Script = 'setup.ps1';                 Pat = "hardenScriptSha256\s*=\s*'([A-F0-9]{64})'" }
+            @{ File = 'devdrive/setup-devdrive.ps1';    Script = 'setup.ps1';                 Pat = "devDriveScriptSha256\s*=\s*'([A-F0-9]{64})'" }
           )
           $ok = $true
           foreach ($c in $checks) {
@@ -189,3 +190,52 @@ jobs:
           $left = @(Get-ChildItem (Join-Path $env:SystemRoot 'Temp') -Directory -Filter 'windows-setup-*' -ErrorAction SilentlyContinue)
           if ($left) { Write-Host "::error::staging folders left behind: $($left.Name -join ', ')"; exit 1 }
           Write-Host "OK  $($svc.Name) running, log kept at $max bytes, no staging folder left"
+      - name: Create a Dev Drive for real, move a projects folder onto it, and re-run it
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $state = (fsutil devdrv query 2>&1) -join ' '
+          if ([Environment]::OSVersion.Version.Build -lt 22621 -or $state -notmatch 'Developer volumes are enabled' -or
+              -not (Get-Command Format-Volume).Parameters.ContainsKey('DevDrive')) {
+            Write-Host "::warning::this runner cannot create a Dev Drive ($state); setup-devdrive.ps1 was not exercised"
+            exit 0
+          }
+          # A small projects folder: one repository with a commit, an uncommitted change and node_modules.
+          $src = Join-Path $env:RUNNER_TEMP 'Projects'
+          $repo = Join-Path $src 'demo'
+          $null = New-Item -ItemType Directory -Path (Join-Path $repo 'node_modules\left-pad') -Force
+          Set-Content (Join-Path $repo 'node_modules\left-pad\index.js') 'module.exports = 1'
+          Set-Content (Join-Path $repo '.gitignore') 'node_modules/'
+          Set-Content (Join-Path $repo 'a.txt') 'one'
+          git -C $repo init -q; git -C $repo add .; git -C $repo -c user.name=ci -c user.email=ci@example.invalid commit -qm init
+          Set-Content (Join-Path $repo 'a.txt') 'two'
+          $head = git -C $repo rev-parse HEAD
+          $hadCargo = Test-Path (Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe')
+
+          $vhd = Join-Path $env:RUNNER_TEMP 'DevDrive\DevDrive.vhdx'
+          $first = powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\devdrive\setup-devdrive.ps1 -VhdPath $vhd -SizeGB 50 -NoDesktopLink -MoveProjectsFrom $src | Out-String
+          Write-Host $first
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::setup-devdrive.ps1 failed (exit $LASTEXITCODE)"; exit 1 }
+
+          $letter = [string](Get-DiskImage -ImagePath $vhd | Get-Disk | Get-Partition | Where-Object DriveLetter | Select-Object -First 1).DriveLetter
+          if (-not $letter) { Write-Host '::error::the VHDX is not attached with a drive letter'; exit 1 }
+          if ((fsutil devdrv query "${letter}:") -notmatch 'trusted developer volume') { Write-Host "::error::${letter}: is not a trusted Dev Drive"; exit 1 }
+          if ((Get-Volume -DriveLetter $letter).FileSystem -ne 'ReFS') { Write-Host '::error::the Dev Drive is not ReFS'; exit 1 }
+          if (-not (Get-ScheduledTask -TaskPath '\DevDrive\' -TaskName 'Attach-DevDrive' -ErrorAction SilentlyContinue)) { Write-Host '::error::no attach task'; exit 1 }
+          $cache = (Get-ItemProperty HKCU:\Environment).npm_config_cache
+          if ($cache -ne "${letter}:\packages\npm") { Write-Host "::error::npm_config_cache is '$cache'"; exit 1 }
+          # rustup's proxies are symbolic links to rustup.exe; they must come along, not be skipped.
+          if ($hadCargo -and -not (Test-Path "${letter}:\packages\cargo\bin\cargo.exe")) { Write-Host '::error::cargo.exe did not move with CARGO_HOME'; exit 1 }
+          $link = Get-Item $src -Force
+          if (-not ($link.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Write-Host '::error::the old projects path is not a link'; exit 1 }
+          $moved = "${letter}:\Prosjekter\demo"
+          if ((git -c safe.directory=* -C $moved rev-parse HEAD) -ne $head) { Write-Host '::error::HEAD differs after the move'; exit 1 }
+          if ((Get-Content (Join-Path $moved 'a.txt')) -ne 'two') { Write-Host '::error::the uncommitted change was lost'; exit 1 }
+          if (Test-Path (Join-Path $moved 'node_modules')) { Write-Host '::error::node_modules was copied'; exit 1 }
+          if (-not (Get-ChildItem $env:USERPROFILE -Directory -Filter 'Projects-backup-*')) { Write-Host '::error::no backup of the original folder'; exit 1 }
+
+          $second = powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\devdrive\setup-devdrive.ps1 -VhdPath $vhd -SizeGB 50 -NoDesktopLink -MoveProjectsFrom $src | Out-String
+          Write-Host $second
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::the re-run failed (exit $LASTEXITCODE)"; exit 1 }
+          if ($second -match '\(set\)|registered|marked as trusted') { Write-Host '::error::the re-run changed something'; exit 1 }
+          Write-Host "OK  Dev Drive ${letter}: trusted, caches and projects on it, re-run changed nothing"

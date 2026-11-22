@@ -137,6 +137,7 @@ For an unattended run, `-Yes` answers y to every prompt and `-Skip` answers n fo
 - **Tools:** KeePassXC, ConfigureDefender (Defender settings GUI in Program Files — installed & signature-verified only, never auto-configured)
 - **Sysmon:** system activity logging to the event log — built-in Sysmon on Windows 11 24H2+ (enables the optional feature if needed), signature-checked Sysinternals download on older Windows (Sysinternals lists Windows 11 and Server 2019 or later), configured with a pinned [SwiftOnSecurity config](sysmon/sysmonconfig-export.xml) and a 1 GB log (measured at ~150 MB a day on an ordinary desktop, so roughly a week of history)
 - **Hardening pass (opt-in, y/n):** offered near the end of the run — see [Hardening pass](#hardening-pass) above for what it changes
+- **Dev Drive (opt-in, y/n):** a trusted ReFS Dev Drive (150 GB VHDX that grows as needed) with the npm, pnpm, Bun, NuGet, pip, uv, Cargo, Go, Gradle, Maven and vcpkg caches moved onto it and a projects folder linked from the Desktop — see *Dev Drive* under the notes below for what it changes and what it costs in protection
 - **Browser:** Google Chrome, Tor Browser
 - **Cleanup / maintenance:** Malwarebytes, AdwCleaner, BleachBit, DriverStore Explorer
 - **Utilities:** Rufus, balenaEtcher, Steam, Discord (only when missing — it updates itself), Windows Notepad (Store)
@@ -164,7 +165,7 @@ VS Build Tools and VirtualBox are large; remove those lines if you don't need th
 ## Notes
 
 - **Reboot when it finishes** to complete Sandbox, Hyper-V, and WSL2 (`wsl -l -v` to verify).
-- **Everything extra is opt-in (y/n):** Scoop, the Neovim config, Claude Code, the tweak tools (Win11Debloat, Winhance, PowerShellPerfect), GitHub sign-in, the Neovim-in-WSL step, the hardening pass and each change inside it, each dual-boot change, `winget upgrade --all` and the disk cleanup. Tweak tools each run in their own process.
+- **Everything extra is opt-in (y/n):** Scoop, the Dev Drive, the Neovim config, Claude Code, the tweak tools (Win11Debloat, Winhance, PowerShellPerfect), GitHub sign-in, the Neovim-in-WSL step, the hardening pass and each change inside it, each dual-boot change, `winget upgrade --all` and the disk cleanup. Tweak tools each run in their own process.
 - **Not behind a prompt:** the Sysmon step. It uses the `install-sysmon.ps1` next to `setup.ps1` in a clone, or downloads it and checks it against the SHA-256 pinned in `setup.ps1`.
 - **Most installers are fetched at run time** — review their URLs and contents before you run the script; see [SECURITY.md](SECURITY.md) for which ones are pinned.
 - **Kubernetes** runs inside Docker Desktop (enable it in Settings); no separate cluster tooling is installed.
@@ -174,7 +175,7 @@ VS Build Tools and VirtualBox are large; remove those lines if you don't need th
 <details>
 <summary><strong>Security &amp; supply-chain</strong></summary>
 
-- **Pins:** `setup.ps1` checks `install-sysmon.ps1` and `harden-extras.ps1` (when there is no local copy), the nvim installer, PowerShellPerfect and the WSL Neovim tarball against SHA-256 pins before anything runs, and CI fails when a pin stops matching. Downloads that run as administrator are verified in an admin-only folder under `%SystemRoot%\Temp`, so a non-elevated process cannot swap them in between.
+- **Pins:** `setup.ps1` checks `install-sysmon.ps1`, `harden-extras.ps1` and `setup-devdrive.ps1` (when there is no local copy), the nvim installer, PowerShellPerfect and the WSL Neovim tarball against SHA-256 pins before anything runs, and CI fails when a pin stops matching. Downloads that run as administrator are verified in an admin-only folder under `%SystemRoot%\Temp`, so a non-elevated process cannot swap them in between.
 - **ConfigureDefender** is downloaded from AndyFul's repo, verified (pinned SHA-256 + signature), copied to `Program Files\ConfigureDefender` and given a Desktop shortcut — but never launched. Open it and pick a level (Default / High / Max) yourself; refresh `$cdSha256` for new builds.
 - **Re-runs are additive:** installs use `winget install --no-upgrade`, so a second run adds what is missing and never moves the version of something already installed (pipx is the exception: it is installed with `pip install --upgrade`). Upgrading is a separate, explicit step at the end of the run.
 - **Sysmon on its own** (existing machine, no full run): from an elevated shell, `irm https://github.com/26zl/personal-windows-setup/raw/main/sysmon/install-sysmon.ps1 | iex`. Re-running reapplies the config and never shrinks a log you made larger; refresh `$configSha256` in `install-sysmon.ps1` (and `$sysmonScriptSha256` in `setup.ps1`) if you replace the XML.
@@ -191,6 +192,52 @@ VS Build Tools and VirtualBox are large; remove those lines if you don't need th
 - **Dual-boot** checks are read-only until you confirm each change. Turning hibernation off (`powercfg /h off`, also clears Fast Startup) is safe for any dual boot. Set the hardware clock to UTC **only** if the other OS is Linux/macOS — not for Windows + Windows. **If BitLocker is on, back up your recovery key** before touching Secure Boot or firmware.
 - **GitHub sign-in** runs `gh auth login --web`, wires git to use `gh` for credentials, and sets your global git identity (login name, `@users.noreply.github.com` when your email is hidden) plus sensible `init.defaultBranch` / `pull.rebase` / `push.autoSetupRemote` defaults.
 - **Neovim** installs my [nvim config](https://github.com/26zl/nvim) into `%LOCALAPPDATA%\nvim` (backs up any existing config; plugins install on first launch) — it needs the C compiler the MSVC toolset provides. The installer is pinned to a commit and its SHA-256; the config it clones comes from that repo's default branch. It can also set up the same config in WSL Debian with a pinned Neovim release checked against its SHA-256; a fresh WSL isn't ready until after a reboot, so re-run for that part.
+
+</details>
+
+<details>
+<summary><strong>Dev Drive (opt-in)</strong></summary>
+
+[`devdrive/setup-devdrive.ps1`](devdrive/setup-devdrive.ps1) sets up a [Dev Drive](https://learn.microsoft.com/windows/dev-drive/): a ReFS volume meant for source code, package caches and build output. The installer offers it right after the toolchains (`-Skip DevDrive` leaves it out), and it also runs on its own on an existing machine:
+
+```powershell
+# from a clone, in an elevated shell; -WhatIf previews every change
+.\devdrive\setup-devdrive.ps1 -WhatIf
+.\devdrive\setup-devdrive.ps1 -MoveProjectsFrom "$HOME\Desktop\Prosjekter"
+```
+
+- **Where:** a dynamically expanding 150 GB VHDX (`-SizeGB`, `-Fixed`) at `<volume>:\DevDrive\DevDrive.vhdx` on the internal SSD data volume with the most free space, or on the system drive when there is none (`-VhdPath` to choose). The folder is admin-only. The letter is the first free one of D, S, V, X that the mount manager has not promised to another disk (`-DriveLetter` to choose). An existing Dev Drive is reused, so a re-run only fixes what is missing.
+- **Attached at boot:** Windows does not attach a VHDX again after a restart, so the SYSTEM task `\DevDrive\Attach-DevDrive` does it. The task runs an inline command, not a script file that a non-elevated process could swap.
+- **Package caches** move to `<drive>:\packages`, set through user environment variables: `npm_config_cache`, `BUN_INSTALL_CACHE_DIR`, `NUGET_PACKAGES`, `NUGET_HTTP_CACHE_PATH`, `PIP_CACHE_DIR`, `UV_CACHE_DIR`, `CARGO_HOME`, `GOMODCACHE`, `GOCACHE`, `GRADLE_USER_HOME`, `MAVEN_OPTS` and `VCPKG_DEFAULT_BINARY_CACHE`, plus `store-dir` in pnpm's global rc. Rustup's proxies live in `CARGO_HOME`, so the user `PATH` follows it. They are symbolic links to `rustup.exe` and are recreated at the new place, not skipped. Existing caches are moved over. Toolchains and SDKs stay on `C:`, as Microsoft recommends.
+- **Projects:** `<drive>:\Prosjekter` (`-ProjectsFolder`), with a link on the Desktop (skipped when OneDrive syncs the Desktop). `-MoveProjectsFrom` does the following:
+  - copies an existing folder without `node_modules`;
+  - checks the copy file by file and per git repository (HEAD and `git status`);
+  - moves the original to `%USERPROFILE%\<name>-backup-<date>` and leaves a link at the old path, so shortcuts, scripts and editor history keep working;
+  - stops before switching when a program still has the folder open, and names the program when Sysinternals `handle.exe` is installed.
+
+  Reinstall `node_modules` from the lockfile afterwards. Both folders are private to you, like your profile, and extra read access the old folder granted (a sandbox group, for example) is carried over.
+
+What it changes for security:
+
+- **Defender is not touched.** Microsoft turns *performance mode* on for new Dev Drives. Files there are then scanned asynchronously ("open now, scan later"), which Microsoft calls faster "but with less protection", though much better than a folder exclusion. Harden System Security turns it off by policy (`Real-Time Protection\DisableAsyncScanOnOpen = 1`, "Disable Dev Drive's lax security around file scanning"). The script reports which applies and leaves the choice to you.
+- **File system filters.** On a trusted Dev Drive only antivirus filters attach by default, so Sysmon would log no file events there. The script allows `SysmonDrv` next to `WdFilter` (`-AllowFilter`). Microsoft lists which other filters its common scenarios need.
+- **Trust** is per machine and set when the drive is formatted. A Dev Drive VHDX brought from another PC stays untrusted until `fsutil devdrv trust`. Only trust one whose contents you trust.
+- **Outside the profile's safety nets.** Controlled folder access protects the Desktop and Documents, not the Dev Drive. System Restore and point-in-time restore do not cover it either, which also means a restore never rolls your repositories back. Keep the work in git with a remote.
+- **A Linux dual boot cannot read ReFS.**
+
+Measured on the machine it was written on, with performance mode off by policy:
+
+| 4000 small files or one 1 GB file | Dev Drive compared with `C:` |
+|---|---|
+| Read the files | about 1.7x faster |
+| List the files | about 3x faster |
+| Delete the files | about 2x faster |
+| Copy the 1 GB file | 0.26 s instead of 10 s (block cloning) |
+| Create the files | 2.2 s instead of 1.4 s (0.8 s on NTFS in a VHDX), so slower |
+
+The faster create path is what performance mode provides.
+
+To undo: point the variables back or delete them, delete the task, then detach the VHDX in Disk Management and delete the file. Move the projects back first.
 
 </details>
 

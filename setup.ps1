@@ -19,7 +19,7 @@ param(
     [switch]$Yes,
     # Opt-in steps to answer n to without asking.
     [ValidateSet('Scoop', 'GitHub', 'Neovim', 'NeovimWsl', 'Hardening', 'ClaudeCode', 'DualBoot', 'Hibernation',
-        'RtcUtc', 'RtcLocal', 'Upgrade', 'DiskCleanup', 'TweakTools', 'Win11Debloat', 'Winhance', 'PowerShellPerfect')]
+        'RtcUtc', 'RtcLocal', 'Upgrade', 'DiskCleanup', 'TweakTools', 'Win11Debloat', 'Winhance', 'PowerShellPerfect', 'DevDrive')]
     [string[]]$Skip = @(),
     # Branch, tag or commit of this repo to fetch install-sysmon.ps1 and harden-extras.ps1 from
     # when no local copy exists; pin it to the ref this setup.ps1 came from.
@@ -67,6 +67,7 @@ $ErrorActionPreference = 'Continue'
 $RepoRaw            = "https://github.com/26zl/personal-windows-setup/raw/$RepoRef"
 $sysmonScriptSha256 = 'B4428769F1614E02AF08EEB7EB32AC2BD065EF9811021525C6591D05470BD4EB'
 $hardenScriptSha256 = '6AC18B73FE15EF041A9CE584D505E441AD07B5B639A996693CF90D642ED3D31D'
+$devDriveScriptSha256 = '89CEDF426B6720BA080EC434E79B75380092B3A870DE6EB2066D5C01A1CA6053'
 # Installers from the owner's other repos: one commit each, plus the file's SHA-256.
 $nvimInstallerCommit = '55ea8ac1ceb2b0a977243a5f190911a6b1015178'
 $nvimInstallerSha256 = '3BA806439D39B7819A4C34FD298D0119FD932A32BD38F81C8985FFC7DBA2E2B1'
@@ -498,6 +499,29 @@ if (Test-WhatIf 'add the VCTools workload to the newest Build Tools install') {
                 $Failed.Add('VC++ toolset (VCTools workload)')
             }
         }
+    }
+}
+
+# Dev Drive: a trusted ReFS volume for repositories and package caches (devdrive/setup-devdrive.ps1).
+# It comes after the toolchains so it can move the caches they created; a re-run only fixes what is missing.
+Write-Host "`n=== Dev Drive (opt in) ===" -ForegroundColor Magenta
+if (Confirm-Step 'DevDrive' "Create a Dev Drive (150 GB ReFS VHDX that grows as needed) for projects and move the package caches to it?") {
+    $devDriveScript = $null
+    try {
+        $devDriveScript = Resolve-OwnScript 'devdrive/setup-devdrive.ps1' $devDriveScriptSha256
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $devDriveScript
+        if ($LASTEXITCODE -eq 0) { Write-Event 'OK' 'Dev Drive set up' }
+        else {
+            Write-Host "    setup-devdrive.ps1 failed (exit $LASTEXITCODE) - see above" -ForegroundColor Yellow
+            Write-Event 'FAIL' "Dev Drive (exit $LASTEXITCODE)"
+            $Failed.Add('Dev Drive')
+        }
+    } catch {
+        Write-Host "    setup-devdrive.ps1 not run: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Event 'FAIL' "Dev Drive - $($_.Exception.Message)"
+        $Failed.Add('Dev Drive')
+    } finally {
+        Remove-StagedFile $devDriveScript
     }
 }
 

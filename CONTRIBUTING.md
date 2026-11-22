@@ -1,6 +1,7 @@
 # Contributing
 
-Three standalone PowerShell scripts for Windows 10/11 plus a Sysmon
+Standalone PowerShell scripts for Windows 10/11 (a health check, a hardening
+pass, a bootstrap installer and a Dev Drive setup) plus a Sysmon
 configuration. Bug reports and pull requests are welcome. For anything that
 could be abused before it is fixed, use the private route in
 [SECURITY.md](SECURITY.md) instead of an issue.
@@ -16,7 +17,9 @@ could be abused before it is fixed, use the private route in
   writes files only for `-ReportPath` and the delegated tools' temporary output
   (the tests pin process starts and deletions to that code), and
   `harden-extras.ps1` changes and writes nothing until the user answers `y` to
-  that specific change.
+  that specific change. `devdrive/setup-devdrive.ps1` changes the system only
+  in functions that ask `ShouldProcess` (so `-WhatIf` previews every change)
+  and never changes Defender settings; its contract tests pin both.
 
 ## Workflow
 
@@ -71,9 +74,10 @@ them for editors:
 ## Pinned files
 
 The pins form a chain: `sysmon/sysmonconfig-export.xml` is pinned in
-`sysmon/install-sysmon.ps1` (`$configSha256`), and `install-sysmon.ps1` and
-`hardening/harden-extras.ps1` are pinned in `setup.ps1` (`$sysmonScriptSha256`,
-`$hardenScriptSha256`). Editing the XML therefore changes all three files.
+`sysmon/install-sysmon.ps1` (`$configSha256`), and `install-sysmon.ps1`,
+`hardening/harden-extras.ps1` and `devdrive/setup-devdrive.ps1` are pinned in
+`setup.ps1` (`$sysmonScriptSha256`, `$hardenScriptSha256`,
+`$devDriveScriptSha256`). Editing the XML therefore changes all three files.
 Update each pin in the same commit (`Get-FileHash <file> -Algorithm SHA256`);
 CI fails on drift.
 
