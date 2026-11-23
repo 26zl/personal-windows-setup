@@ -219,7 +219,10 @@ jobs:
 
           $letter = [string](Get-DiskImage -ImagePath $vhd | Get-Disk | Get-Partition | Where-Object DriveLetter | Select-Object -First 1).DriveLetter
           if (-not $letter) { Write-Host '::error::the VHDX is not attached with a drive letter'; exit 1 }
-          if ((fsutil devdrv query "${letter}:") -notmatch 'trusted developer volume') { Write-Host "::error::${letter}: is not a trusted Dev Drive"; exit 1 }
+          # One string: fsutil prints several lines, and -notmatch on an array returns the lines that do not match.
+          $query = (fsutil devdrv query "${letter}:") -join ' '
+          if ($query -notmatch 'This is a trusted developer volume') { Write-Host "::error::${letter}: is not a trusted Dev Drive ($query)"; exit 1 }
+          if ($query -notmatch 'Filters allowed on any developer volume:\s+[^:]*SysmonDrv') { Write-Host "::error::SysmonDrv is not allowed on Dev Drives ($query)"; exit 1 }
           if ((Get-Volume -DriveLetter $letter).FileSystem -ne 'ReFS') { Write-Host '::error::the Dev Drive is not ReFS'; exit 1 }
           if (-not (Get-ScheduledTask -TaskPath '\DevDrive\' -TaskName 'Attach-DevDrive' -ErrorAction SilentlyContinue)) { Write-Host '::error::no attach task'; exit 1 }
           $cache = (Get-ItemProperty HKCU:\Environment).npm_config_cache
@@ -242,5 +245,6 @@ jobs:
           $second = powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\devdrive\setup-devdrive.ps1 -VhdPath $vhd -SizeGB 50 -NoDesktopLink -MoveProjectsFrom $src | Out-String
           Write-Host $second
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::the re-run failed (exit $LASTEXITCODE)"; exit 1 }
-          if ($second -match '\(set\)|registered|marked as trusted') { Write-Host '::error::the re-run changed something'; exit 1 }
+          # Every line the script prints when it changes something.
+          if ($second -match '\(set\)|registered|marked as trusted|picks this up|new Dev Drive|copying ') { Write-Host '::error::the re-run changed something'; exit 1 }
           Write-Host "OK  Dev Drive ${letter}: trusted, caches and projects on it, re-run changed nothing"
