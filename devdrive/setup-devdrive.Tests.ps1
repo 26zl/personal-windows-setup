@@ -72,7 +72,7 @@ Describe 'Change contract' {
             $member = $call.Member.Extent.Text
             $static = $call.Static -and $call.Expression -is [System.Management.Automation.Language.TypeExpressionAst] -and
             $call.Expression.TypeName.FullName -match $types -and $member -match '^(Move|Delete|Copy|Replace|Create|Write|Append|Set)'
-            $instance = -not $call.Static -and $member -match '^(SetAccessControl|MoveTo|Delete)$'
+            $instance = -not $call.Static -and $member -match '^(SetAccessControl|MoveTo|Delete|Save)$'
             if (-not ($static -or $instance)) { continue }
             $function = $call.Parent
             while ($function -and $function -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $function = $function.Parent }
@@ -213,8 +213,8 @@ Describe 'Cache map' {
 
     It 'covers the caches Microsoft lists for Dev Drive and the ones this setup installs' {
         $names = @($script:Map | ForEach-Object Name)
-        foreach ($expected in 'npm_config_cache', 'store-dir', 'BUN_INSTALL_CACHE_DIR', 'NUGET_PACKAGES', 'NUGET_HTTP_CACHE_PATH', 'PIP_CACHE_DIR',
-            'UV_CACHE_DIR', 'CARGO_HOME', 'GOMODCACHE', 'GOCACHE', 'GRADLE_USER_HOME', 'MAVEN_OPTS', 'VCPKG_DEFAULT_BINARY_CACHE') {
+        foreach ($expected in 'npm_config_cache', 'store-dir', 'cache-dir', 'BUN_INSTALL_CACHE_DIR', 'NUGET_PACKAGES', 'NUGET_HTTP_CACHE_PATH', 'PIP_CACHE_DIR',
+            'UV_CACHE_DIR', 'CARGO_HOME', 'GOMODCACHE', 'GOCACHE', 'GRADLE_USER_HOME', 'MAVEN_OPTS', 'VCPKG_DEFAULT_BINARY_CACHE', 'PRE_COMMIT_HOME') {
             $names | Should -Contain $expected
         }
         ($names | Sort-Object -Unique).Count | Should -Be $names.Count
@@ -225,6 +225,10 @@ Describe 'Cache map' {
             $entry.Path | Should -BeLike 'S:\packages\*'
             foreach ($old in $entry.Old) { $old | Should -Not -BeLike 'S:\*' }
         }
+    }
+
+    It 'starts pre-commit afresh instead of moving hook environments that hold absolute paths' {
+        @($script:Map | Where-Object { $_.Fresh } | ForEach-Object Name) | Should -Be @('PRE_COMMIT_HOME')
     }
 
     It 'falls back to %USERPROFILE%\go when GOPATH is not set' {

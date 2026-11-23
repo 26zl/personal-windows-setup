@@ -16,14 +16,16 @@
        after a restart.
     3. Lets Defender and the Sysmon driver attach to Dev Drives. By default only antivirus
        filters attach there, so Sysmon would log no file events on the Dev Drive.
-    4. Creates <drive>:\packages and points npm, pnpm, Bun, NuGet, pip, uv, Cargo, Go, Gradle,
-       Maven and vcpkg at it (user environment variables and pnpm's global rc), moving existing
-       caches over. CARGO_HOME also holds rustup's proxies, so the user PATH follows it.
-    5. Creates <drive>:\<ProjectsFolder> (private to you, like your profile) and a link to it on
-       the Desktop. -MoveProjectsFrom copies an existing folder there without node_modules,
+    4. Creates <drive>:\packages and points npm, pnpm (store and metadata cache), Bun, NuGet,
+       pip, uv, Cargo, Go, Gradle, Maven, vcpkg and pre-commit at it (user environment variables,
+       plus pnpm's global rc for pnpm 10 and older), moving existing caches over. CARGO_HOME also holds rustup's
+       proxies, so the user PATH follows it. pre-commit starts a new store there instead: its
+       hook environments hold absolute paths and would break if moved.
+    5. Creates <drive>:\<ProjectsFolder> (private to you, like your profile) and a shortcut to it
+       on the Desktop. -MoveProjectsFrom copies an existing folder there without node_modules,
        checks the copy file by file and per git repository, renames the original to
        <name>-backup-<date> (in %USERPROFILE%, or beside the folder when that is on another
-       drive) and leaves a link at the old path.
+       drive) and leaves a link at the old path, hidden when it is on the Desktop.
 
   It does not change Defender. Performance mode (asynchronous scanning on trusted Dev Drives)
   is reported, not switched: hardening baselines often turn it off on purpose.
@@ -164,6 +166,7 @@ function Get-CacheMap {
     @(
         [pscustomobject]@{ Tool = 'npm';              Kind = 'Env';    Name = 'npm_config_cache';           Path = "$Root\npm";              Old = @("$LocalAppData\npm-cache", "$AppData\npm-cache") }
         [pscustomobject]@{ Tool = 'pnpm store';       Kind = 'PnpmRc'; Name = 'store-dir';                  Path = "$Root\pnpm-store";       Old = @("$LocalAppData\pnpm\store") }
+        [pscustomobject]@{ Tool = 'pnpm cache';       Kind = 'PnpmRc'; Name = 'cache-dir';                  Path = "$Root\pnpm-cache";       Old = @("$LocalAppData\pnpm-cache") }
         [pscustomobject]@{ Tool = 'Bun';              Kind = 'Env';    Name = 'BUN_INSTALL_CACHE_DIR';      Path = "$Root\bun";              Old = @("$UserProfile\.bun\install\cache") }
         [pscustomobject]@{ Tool = 'NuGet packages';   Kind = 'Env';    Name = 'NUGET_PACKAGES';             Path = "$Root\nuget\packages";   Old = @("$UserProfile\.nuget\packages") }
         [pscustomobject]@{ Tool = 'NuGet HTTP cache'; Kind = 'Env';    Name = 'NUGET_HTTP_CACHE_PATH';      Path = "$Root\nuget\http-cache"; Old = @("$LocalAppData\NuGet\v3-cache") }
@@ -175,6 +178,8 @@ function Get-CacheMap {
         [pscustomobject]@{ Tool = 'Gradle';           Kind = 'Env';    Name = 'GRADLE_USER_HOME';           Path = "$Root\gradle";           Old = @("$UserProfile\.gradle") }
         [pscustomobject]@{ Tool = 'Maven';            Kind = 'Maven';  Name = 'MAVEN_OPTS';                 Path = "$Root\maven";            Old = @("$UserProfile\.m2\repository") }
         [pscustomobject]@{ Tool = 'vcpkg';            Kind = 'Env';    Name = 'VCPKG_DEFAULT_BINARY_CACHE'; Path = "$Root\vcpkg";            Old = @("$LocalAppData\vcpkg\archives", "$AppData\vcpkg\archives") }
+        # Fresh: the hook environments hold absolute paths, so pre-commit builds them again in the new place.
+        [pscustomobject]@{ Tool = 'pre-commit';       Kind = 'Env';    Name = 'PRE_COMMIT_HOME';            Path = "$Root\pre-commit";       Old = @("$UserProfile\.cache\pre-commit"); Fresh = $true }
     )
 }
 
@@ -527,18 +532,18 @@ function Update-UserPath {
     $true
 }
 
-function Set-PnpmStoreDir {
-    # pnpm reads store-dir from its global rc (%LOCALAPPDATA%\pnpm\config\rc).
+function Set-PnpmRcValue {
+    # pnpm reads store-dir and cache-dir from its global rc (%LOCALAPPDATA%\pnpm\config\rc).
     [OutputType([bool])]
     [CmdletBinding(SupportsShouldProcess)]
-    param([string]$Path)
+    param([string]$Key, [string]$Value)
     $rc = Join-Path $env:LOCALAPPDATA 'pnpm\config\rc'
     $lines = @()
     if (Test-Path -LiteralPath $rc) { $lines = @(Get-Content -LiteralPath $rc) }
-    $line = "store-dir=$Path"
+    $line = "$Key=$Value"
     if ($lines -contains $line) { return $false }
     if (-not $PSCmdlet.ShouldProcess($rc, "set $line")) { return $false }
-    $kept = @($lines | Where-Object { $_ -notmatch '^\s*store-dir\s*=' })
+    $kept = @($lines | Where-Object { $_ -notmatch ('^\s*' + [regex]::Escape($Key) + '\s*=') })
     $null = New-Item -ItemType Directory -Path (Split-Path -Parent $rc) -Force
     [IO.File]::WriteAllText($rc, ((@($kept) + $line) -join "`n") + "`n", (New-Object Text.UTF8Encoding($false)))
     $true
@@ -598,10 +603,18 @@ function Set-PackageCache {
                 $previous = (Get-Item 'HKCU:\Environment').GetValue('MAVEN_OPTS', $null, 'DoNotExpandEnvironmentNames')
                 $changed = Set-UserEnvironmentValue -Name 'MAVEN_OPTS' -Value (Get-MavenOptsValue -Current $previous -Repository $cache.Path)
             }
-            'PnpmRc' { $changed = Set-PnpmStoreDir -Path $cache.Path }
+            'PnpmRc' {
+                $changed = Set-PnpmRcValue -Key $cache.Name -Value $cache.Path
+                # pnpm 11 no longer reads these from the rc; pnpm 10 and 11 both read pnpm_config_* variables.
+                if (Set-UserEnvironmentValue -Name ('pnpm_config_' + $cache.Name.Replace('-', '_')) -Value $cache.Path) { $changed = $true }
+            }
         }
         foreach ($source in ($old | Select-Object -Unique)) {
             if (-not $source -or (Test-SamePath $source $cache.Path) -or (Test-PathOnDrive -Path $source -Letter $Letter)) { continue }
+            if ($cache.Fresh) {
+                if ($changed -and (Test-Path -LiteralPath $source)) { Write-Note "$($cache.Tool) builds its store again in $($cache.Path); the old one in $source is no longer used and can be deleted" }
+                continue
+            }
             if ($cache.Tool -eq 'Cargo' -and (Get-Process -Name cargo, rustc, rustup, rust-analyzer -ErrorAction SilentlyContinue)) {
                 Write-Note "Cargo is running; $source was not moved. Close it and run this again."
                 continue
@@ -698,17 +711,44 @@ function Move-ProjectFolder {
 }
 
 function New-ProjectLink {
+    # A shortcut on the Desktop. A link that -MoveProjectsFrom left under the same name is hidden,
+    # not removed: old paths keep working through it, and the Desktop shows only the shortcut.
     [CmdletBinding(SupportsShouldProcess)]
-    param([string]$Link, [string]$Target)
-    if (Test-Path -LiteralPath $Link) { return }
-    $desktop = Split-Path -Parent $Link
+    param([string]$Desktop, [string]$Name, [string]$Target)
+    if (-not $Desktop -or -not (Test-Path -LiteralPath $Desktop)) { Write-Note "there is no Desktop folder; no shortcut to $Target was created"; return }
     foreach ($cloud in $env:OneDrive, $env:OneDriveConsumer, $env:OneDriveCommercial) {
-        if ($cloud -and $desktop.StartsWith($cloud, [StringComparison]::OrdinalIgnoreCase)) {
-            Write-Note "the Desktop is synced by OneDrive; no link to $Target was created there"
+        if ($cloud -and $Desktop.StartsWith($cloud, [StringComparison]::OrdinalIgnoreCase)) {
+            Write-Note "the Desktop is synced by OneDrive; no shortcut to $Target was created there"
             return
         }
     }
-    if ($PSCmdlet.ShouldProcess($Link, "create a link to $Target")) { $null = New-Item -ItemType Junction -Path $Link -Target $Target }
+    $same = Get-Item -LiteralPath (Join-Path $Desktop $Name) -Force -ErrorAction SilentlyContinue
+    if ($same) {
+        if (-not ($same.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not (Test-SamePath ([string]$same.Target) $Target)) {
+            Write-Note "the Desktop already has a folder named $Name; no shortcut was created"
+            return
+        }
+        # The attribute goes on the link itself, not on the folder it points to.
+        if (-not ($same.Attributes -band [IO.FileAttributes]::Hidden) -and $PSCmdlet.ShouldProcess($same.FullName, 'hide this link; old paths keep working through it')) {
+            $same.Attributes = $same.Attributes -bor [IO.FileAttributes]::Hidden
+            Write-Detail "$($same.FullName) is now hidden; old paths keep working through it"
+        }
+    }
+    $file = Join-Path $Desktop "$Name.lnk"
+    $shell = New-Object -ComObject WScript.Shell
+    if (Test-Path -LiteralPath $file) {
+        $current = $shell.CreateShortcut($file).TargetPath
+        if (-not (Test-SamePath $current $Target)) { Write-Note "$file points to $current; left as it is" }
+        return
+    }
+    if ($PSCmdlet.ShouldProcess($file, "create a shortcut to $Target")) {
+        $shortcut = $shell.CreateShortcut($file)
+        $shortcut.TargetPath = $Target
+        $shortcut.WorkingDirectory = $Target
+        $shortcut.Description = "$Name on the Dev Drive"
+        $shortcut.Save()
+        Write-Detail "Desktop shortcut created: $file -> $Target"
+    }
 }
 
 function Send-EnvironmentChange {
@@ -816,7 +856,7 @@ function Invoke-DevDriveSetup {
 
     Write-Step 'Projects'
     if ($MoveProjectsFrom) { Move-ProjectFolder -Source $MoveProjectsFrom -Destination $projects }
-    if (-not $NoDesktopLink) { New-ProjectLink -Link (Join-Path ([Environment]::GetFolderPath('Desktop')) $ProjectsFolder) -Target $projects }
+    if (-not $NoDesktopLink) { New-ProjectLink -Desktop ([Environment]::GetFolderPath('Desktop')) -Name $ProjectsFolder -Target $projects }
     Write-Detail "projects folder: $projects"
 
     Write-Step 'Defender'

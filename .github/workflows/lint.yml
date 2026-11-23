@@ -211,9 +211,11 @@ jobs:
           Set-Content (Join-Path $repo 'a.txt') 'two'
           $head = git -C $repo rev-parse HEAD
           $hadCargo = Test-Path (Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe')
+          # The script puts a shortcut there; make sure the runner's profile has a Desktop folder.
+          $null = [Environment]::GetFolderPath('Desktop', 'Create')
 
           $vhd = Join-Path $env:RUNNER_TEMP 'DevDrive\DevDrive.vhdx'
-          $first = powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\devdrive\setup-devdrive.ps1 -VhdPath $vhd -SizeGB 50 -NoDesktopLink -MoveProjectsFrom $src | Out-String
+          $first = powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\devdrive\setup-devdrive.ps1 -VhdPath $vhd -SizeGB 50 -MoveProjectsFrom $src | Out-String
           Write-Host $first
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::setup-devdrive.ps1 failed (exit $LASTEXITCODE)"; exit 1 }
 
@@ -227,6 +229,14 @@ jobs:
           if (-not (Get-ScheduledTask -TaskPath '\DevDrive\' -TaskName 'Attach-DevDrive' -ErrorAction SilentlyContinue)) { Write-Host '::error::no attach task'; exit 1 }
           $cache = (Get-ItemProperty HKCU:\Environment).npm_config_cache
           if ($cache -ne "${letter}:\packages\npm") { Write-Host "::error::npm_config_cache is '$cache'"; exit 1 }
+          $preCommit = (Get-ItemProperty HKCU:\Environment).PRE_COMMIT_HOME
+          if ($preCommit -ne "${letter}:\packages\pre-commit") { Write-Host "::error::PRE_COMMIT_HOME is '$preCommit'"; exit 1 }
+          if (-not (Select-String -LiteralPath "$env:LOCALAPPDATA\pnpm\config\rc" -SimpleMatch "cache-dir=${letter}:\packages\pnpm-cache" -Quiet)) { Write-Host "::error::pnpm's cache-dir is not on the Dev Drive"; exit 1 }
+          # pnpm 11 reads only the pnpm_config_* variables for these.
+          $pnpmEnv = Get-ItemProperty HKCU:\Environment
+          if ($pnpmEnv.pnpm_config_store_dir -ne "${letter}:\packages\pnpm-store" -or $pnpmEnv.pnpm_config_cache_dir -ne "${letter}:\packages\pnpm-cache") { Write-Host '::error::pnpm_config_store_dir or pnpm_config_cache_dir is not on the Dev Drive'; exit 1 }
+          $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path ([Environment]::GetFolderPath('Desktop')) 'Prosjekter.lnk'))
+          if ($shortcut.TargetPath -ne "${letter}:\Prosjekter") { Write-Host "::error::the Desktop shortcut points to '$($shortcut.TargetPath)'"; exit 1 }
           # rustup's proxies are symbolic links to rustup.exe; they must come along, not be skipped.
           if ($hadCargo -and -not (Test-Path "${letter}:\packages\cargo\bin\cargo.exe")) { Write-Host '::error::cargo.exe did not move with CARGO_HOME'; exit 1 }
           $link = Get-Item $src -Force
@@ -242,9 +252,9 @@ jobs:
           if ($backup.Count -ne 1) { Write-Host "::error::expected one backup of the original folder in $backupParent, found $($backup.Count)"; exit 1 }
           if (-not (Test-Path (Join-Path $backup[0].FullName 'demo\.git')) -or (Get-Content (Join-Path $backup[0].FullName 'demo\a.txt')) -ne 'two') { Write-Host '::error::the backup is not the whole original'; exit 1 }
 
-          $second = powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\devdrive\setup-devdrive.ps1 -VhdPath $vhd -SizeGB 50 -NoDesktopLink -MoveProjectsFrom $src | Out-String
+          $second = powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\devdrive\setup-devdrive.ps1 -VhdPath $vhd -SizeGB 50 -MoveProjectsFrom $src | Out-String
           Write-Host $second
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::the re-run failed (exit $LASTEXITCODE)"; exit 1 }
           # Every line the script prints when it changes something.
-          if ($second -match '\(set\)|registered|marked as trusted|picks this up|new Dev Drive|copying ') { Write-Host '::error::the re-run changed something'; exit 1 }
-          Write-Host "OK  Dev Drive ${letter}: trusted, caches and projects on it, re-run changed nothing"
+          if ($second -match '\(set\)|registered|marked as trusted|picks this up|new Dev Drive|copying |Desktop shortcut created|is now hidden') { Write-Host '::error::the re-run changed something'; exit 1 }
+          Write-Host "OK  Dev Drive ${letter}: trusted, caches, projects and Desktop shortcut in place, re-run changed nothing"
